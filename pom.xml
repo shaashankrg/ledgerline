@@ -16,6 +16,7 @@
 
 	<properties>
 		<java.version>21</java.version>
+		<testcontainers.version>1.21.3</testcontainers.version>
 	</properties>
 
 	<dependencies>
@@ -56,6 +57,25 @@
 			<artifactId>spring-boot-starter-test</artifactId>
 			<scope>test</scope>
 		</dependency>
+
+		<!-- Real throwaway Postgres for tests. The invariant under test is that
+		     Postgres plus our constraints produce a balanced ledger, which a
+		     mocked datasource cannot verify. -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-testcontainers</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>postgresql</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>junit-jupiter</artifactId>
+			<scope>test</scope>
+		</dependency>
 	</dependencies>
 
 	<build>
@@ -63,6 +83,19 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<!-- docker-java negotiates Docker API v1.32 by default, which is
+					     below the v1.40 floor enforced by Docker Engine 29. The
+					     daemon answers the /info probe with HTTP 400, and
+					     Testcontainers reads that as "no Docker available". Asking
+					     for a version above the floor lets it connect; the client
+					     then negotiates the daemon's actual version. -->
+					<argLine>-Dapi.version=1.43</argLine>
+				</configuration>
 			</plugin>
 		</plugins>
 	</build>
