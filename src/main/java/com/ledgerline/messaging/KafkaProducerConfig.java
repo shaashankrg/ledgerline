@@ -1,0 +1,87 @@
+package com.ledgerline.messaging;
+
+import java.util.HashMap;
+import java.util.Map;
+
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.core.DefaultKafkaProducerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
+import org.springframework.kafka.support.serializer.JsonSerializer;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+/**
+ * Producer wiring for the {@code transactions} topic.
+ *
+ * The durability settings here are the point of this class, so they are set
+ * explicitly rather than left to defaults -- a future Kafka client changing a
+ * default should not silently change what "published" means for money.
+ */
+@Configuration
+class KafkaProducerConfig {
+
+    @Bean
+    ProducerFactory<String, TransactionMessage> transactionProducerFactory(
+            @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
+            ObjectMapper objectMapper) {
+
+        Map<String, Object> config = new HashMap<>();
+        config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+
+        /*
+         * acks=all, not acks=1.
+         *
+         * acks=1 acknowledges as soon as the partition leader has written the
+         * record, before any follower has copied it. If that leader fails
+         * before replication, the record is gone and the producer has already
+         * been told it succeeded -- a silent loss, which for a financial
+         * transaction means a transfer that the ledger believes was published
+         * and that no consumer will ever see.
+         *
+         * acks=all waits for every in-sync replica. It costs latency, and on
+         * this single-node development broker it is satisfied by the one
+         * replica that exists. The setting is here so the guarantee is already
+         * correct when this runs against a replicated cluster, rather than
+         * being something to remember to change later.
+         */
+        config.put(ProducerConfig.ACKS_CONFIG, "all");
+
+        /*
+         * Idempotent producer: the broker deduplicates records by producer id
+         * and sequence number, so a retry after a network timeout appends the
+         * record once rather than twice. Without it, retries turn an ambiguous
+         * failure into a duplicate transaction on the topic.
+         */
+        config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        config.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
+
+        // Bounds the total time spent retrying before the send is failed, so a
+        // caller cannot block indefinitely on an unreachable broker.
+        config.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120_000);
+        config.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30_000);
+
+        // Required to be <= 5 for idempotence to preserve ordering on retry.
+        config.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+
+        // Built from the application's ObjectMapper so the message uses the
+        // serializer declared on TransactionMessage.amount. Type headers are
+        // off: the payload is a plain JSON contract, not a Java-typed one, and
+        // a consumer in another language should not have to ignore them.
+        JsonSerializer<TransactionMessage> valueSerializer = new JsonSerializer<>(objectMapper);
+        valueSerializer.setAddTypeInfo(false);
+
+        return new DefaultKafkaProducerFactory<>(config, new StringSerializer(), valueSerializer);
+    }
+
+    @Bean
+    KafkaTemplate<String, TransactionMessage> transactionKafkaTemplate(
+            ProducerFactory<String, TransactionMessage> transactionProducerFactory) {
+        return new KafkaTemplate<>(transactionProducerFactory);
+    }
+}

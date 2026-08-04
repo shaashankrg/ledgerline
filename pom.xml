@@ -52,6 +52,13 @@
 			<scope>runtime</scope>
 		</dependency>
 
+		<!-- Kafka client. Unavoidable for today's goal: there is no way to reach
+		     a broker without it. Version is managed by the Spring Boot parent. -->
+		<dependency>
+			<groupId>org.springframework.kafka</groupId>
+			<artifactId>spring-kafka</artifactId>
+		</dependency>
+
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-test</artifactId>
@@ -74,6 +81,14 @@
 		<dependency>
 			<groupId>org.testcontainers</groupId>
 			<artifactId>junit-jupiter</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<!-- Real broker for the producer tests, for the same reason Postgres is
+		     real: serialization and partitioning are properties of the broker
+		     protocol, and a mock cannot demonstrate them. -->
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>kafka</artifactId>
 			<scope>test</scope>
 		</dependency>
 	</dependencies>

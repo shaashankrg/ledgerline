@@ -17,5 +17,74 @@ services:
       timeout: 5s
       retries: 10
 
+  # KRaft mode: this single node is both broker and controller, so there is no
+  # ZooKeeper to run alongside it.
+  kafka:
+    image: confluentinc/cp-kafka:7.8.0
+    container_name: ledgerline-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Two listeners: clients on the host reach 9092, while brokers and the
+      # controller talk over the compose network. Without the split, the
+      # advertised address would be a container hostname the host cannot resolve.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # Single-node development cluster, so nothing can be replicated further
+      # than one copy. The producer's acks=all is satisfied by that one replica
+      # here; on a real cluster it would mean every in-sync replica.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Topics are created explicitly by kafka-init below, so a typo in a topic
+      # name fails loudly instead of silently creating a new topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      # KRaft requires a cluster id that decodes as a 16-byte UUID, so this is a
+      # fixed base64 value rather than a readable name. Pinning it keeps the id
+      # stable across restarts, which matters because the formatted log
+      # directory records it and refuses to start against a different one.
+      CLUSTER_ID: ZWRnZXJsaW5lTG9jYWwxMg
+    volumes:
+      - ledgerline-kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+
+  # Runs once to create the topic, then exits. Depends on the broker being
+  # healthy so it cannot race the broker's startup.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.8.0
+    container_name: ledgerline-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # One partition: ordering is per-partition in Kafka, and a single partition
+    # is the simplest way to keep every transaction message globally ordered
+    # while the pipeline is being built.
+    command: >
+      kafka-topics
+      --bootstrap-server kafka:29092
+      --create --if-not-exists
+      --topic transactions
+      --partitions 1
+      --replication-factor 1
+    restart: "no"
+
 volumes:
   ledgerline-pgdata:
+  ledgerline-kafkadata:
