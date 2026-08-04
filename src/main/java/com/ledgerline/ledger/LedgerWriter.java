@@ -39,11 +39,28 @@ public class LedgerWriter {
     @Transactional
     public long recordTransfer(long fromAccountId, long toAccountId, BigDecimal amount, String idempotencyKey) {
         long transactionId = insertTransaction(idempotencyKey);
+        recordEntries(transactionId, fromAccountId, toAccountId, amount);
+        return transactionId;
+    }
+
+    /**
+     * Writes the balanced pair against a transaction row that already exists.
+     *
+     * Callers that must create the transaction row themselves -- the transfer
+     * service claims an idempotency key by inserting it -- use this instead of
+     * {@link #recordTransfer}, which would insert a second row for the same
+     * key. The responsibility is unchanged either way: this writes a balanced
+     * pair and nothing else, and knows nothing about idempotency or validation.
+     *
+     * Joins the caller's transaction when there is one, so the entries commit
+     * or roll back together with whatever else that caller has written.
+     */
+    @Transactional
+    public void recordEntries(long transactionId, long fromAccountId, long toAccountId, BigDecimal amount) {
         // Debit the source, credit the destination. The pair sums to zero by
         // construction: same magnitude, opposite signs.
         insertEntry(transactionId, fromAccountId, amount.negate());
         insertEntry(transactionId, toAccountId, amount);
-        return transactionId;
     }
 
     private long insertTransaction(String idempotencyKey) {
