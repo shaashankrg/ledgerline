@@ -123,6 +123,27 @@ class ApiExceptionHandler {
     }
 
     /**
+     * 404 rather than the transfer layer's 422: on a read the account is the
+     * resource being addressed, so its absence is a missing resource rather
+     * than an unprocessable request.
+     */
+    @ExceptionHandler(AccountReadController.AccountNotFoundInReadException.class)
+    ProblemDetail handleAccountMissingOnRead(AccountReadController.AccountNotFoundInReadException e) {
+        return problem(HttpStatus.NOT_FOUND, ErrorTypes.RESOURCE_NOT_FOUND,
+                "Account not found", e.getMessage());
+    }
+
+    /**
+     * A cursor the service did not issue is a client error, not a server one --
+     * without this it would surface as a decode failure and a 500.
+     */
+    @ExceptionHandler(EntryCursor.MalformedCursorException.class)
+    ProblemDetail handleMalformedCursor(EntryCursor.MalformedCursorException e) {
+        return problem(HttpStatus.BAD_REQUEST, ErrorTypes.MALFORMED_CURSOR,
+                "Malformed cursor", e.getMessage());
+    }
+
+    /**
      * Catch-all.
      *
      * The response carries a correlation id and nothing else. Exception

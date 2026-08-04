@@ -35,6 +35,12 @@ public final class ErrorTypes {
     /** Request body was not well-formed JSON, or a field had the wrong type. */
     public static final URI MALFORMED_REQUEST = URI.create(BASE + "malformed-request");
 
+    /** The addressed resource does not exist. */
+    public static final URI RESOURCE_NOT_FOUND = URI.create(BASE + "resource-not-found");
+
+    /** Pagination cursor was not a token this service issued. */
+    public static final URI MALFORMED_CURSOR = URI.create(BASE + "malformed-cursor");
+
     /** Anything unhandled. Carries a correlation id and no detail. */
     public static final URI INTERNAL_ERROR = URI.create(BASE + "internal-error");
 
