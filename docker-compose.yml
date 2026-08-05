@@ -65,7 +65,7 @@ services:
       retries: 20
       start_period: 15s
 
-  # Runs once to create the topic, then exits. Depends on the broker being
+  # Runs once to create the topics, then exits. Depends on the broker being
   # healthy so it cannot race the broker's startup.
   kafka-init:
     image: confluentinc/cp-kafka:7.8.0
@@ -73,16 +73,20 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    # One partition: ordering is per-partition in Kafka, and a single partition
-    # is the simplest way to keep every transaction message globally ordered
-    # while the pipeline is being built.
+    # One partition each: ordering is per-partition in Kafka, and a single
+    # partition is the simplest way to keep every transaction message globally
+    # ordered while the pipeline is being built.
+    #
+    # transactions.DLT holds messages that can never be processed. It is created
+    # up front rather than on first failure, so the consumer is never publishing
+    # a dead letter to a topic that does not exist yet.
     command: >
-      kafka-topics
-      --bootstrap-server kafka:29092
-      --create --if-not-exists
-      --topic transactions
-      --partitions 1
-      --replication-factor 1
+      bash -c "
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+      --topic transactions --partitions 1 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+      --topic transactions.DLT --partitions 1 --replication-factor 1
+      "
     restart: "no"
 
 volumes:

@@ -84,4 +84,33 @@ class KafkaProducerConfig {
             ProducerFactory<String, TransactionMessage> transactionProducerFactory) {
         return new KafkaTemplate<>(transactionProducerFactory);
     }
+
+    /**
+     * Producer for the dead letter topic, sending raw strings.
+     *
+     * Separate from the typed template because a dead letter carries the
+     * original payload verbatim, including payloads that are not valid
+     * TransactionMessages at all -- routing those through a serializer that
+     * expects a well-formed object is impossible by definition.
+     *
+     * Same durability settings: a dead letter that is silently lost leaves a
+     * rejected transfer with no record anywhere.
+     */
+    @Bean
+    KafkaTemplate<String, String> deadLetterKafkaTemplate(
+            @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers) {
+
+        Map<String, Object> config = new HashMap<>();
+        config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        config.put(ProducerConfig.ACKS_CONFIG, "all");
+        config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        config.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
+        config.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120_000);
+        config.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30_000);
+        config.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+
+        return new KafkaTemplate<>(new DefaultKafkaProducerFactory<>(config));
+    }
 }
