@@ -62,7 +62,11 @@ class TransactionConsumer {
     @KafkaListener(
             topics = TransactionProducer.TOPIC,
             groupId = KafkaConsumerConfig.GROUP_ID,
-            containerFactory = "transactionListenerContainerFactory")
+            containerFactory = "transactionListenerContainerFactory",
+            // Always on in production. The flag exists so a test exercising the
+            // intake path alone does not have to run a broker for a consumer it
+            // never uses.
+            autoStartup = "${ledgerline.consumer.enabled:true}")
     void consume(ConsumerRecord<String, String> record, Acknowledgment acknowledgment) {
         try {
             TransferRequest request = parser.parse(record.value());

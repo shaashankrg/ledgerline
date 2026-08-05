@@ -11,15 +11,24 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.kafka.ConfluentKafkaContainer;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -33,6 +42,32 @@ import com.ledgerline.AbstractPostgresTest;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class AccountReadControllerTest extends AbstractPostgresTest {
+
+    // Intake publishes now, so these tests need a broker and the consumer even
+    // though what they assert on is the read path.
+    private static final String TRANSACTIONS_TOPIC = "transactions";
+    private static final String DLT_TOPIC = "transactions.DLT";
+
+    private static final ConfluentKafkaContainer KAFKA =
+            new ConfluentKafkaContainer("confluentinc/cp-kafka:7.8.0");
+
+    static {
+        KAFKA.start();
+        try (AdminClient admin = AdminClient.create(Map.of(
+                AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers()))) {
+            admin.createTopics(List.of(
+                    new NewTopic(TRANSACTIONS_TOPIC, 3, (short) 1),
+                    new NewTopic(DLT_TOPIC, 1, (short) 1)))
+                    .all().get(30, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            throw new IllegalStateException("could not create topics", e);
+        }
+    }
+
+    @DynamicPropertySource
+    static void kafkaProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
+    }
 
     @LocalServerPort
     private int port;
@@ -50,9 +85,23 @@ class AccountReadControllerTest extends AbstractPostgresTest {
     private long carol;
 
     @BeforeEach
-    void setUp() {
-        jdbc.update("DELETE FROM ledger_entries");
-        jdbc.update("DELETE FROM transactions");
+    void setUp() throws Exception {
+        // Entries first, then transactions: the foreign key forbids the other
+        // order. Retried because the consumer runs on its own thread and may be
+        // mid-write from a previous test when this fires.
+        long deadline = System.currentTimeMillis() + Duration.ofSeconds(10).toMillis();
+        while (true) {
+            try {
+                jdbc.update("DELETE FROM ledger_entries");
+                jdbc.update("DELETE FROM transactions");
+                break;
+            } catch (DataIntegrityViolationException e) {
+                if (System.currentTimeMillis() > deadline) {
+                    throw e;
+                }
+                Thread.sleep(100);
+            }
+        }
 
         alice = accountId("Alice Checking");
         bob = accountId("Bob Checking");
@@ -268,10 +317,21 @@ class AccountReadControllerTest extends AbstractPostgresTest {
         return new BigDecimal(getJson("/api/v1/accounts/" + accountId + "/balance").get("balance").asText());
     }
 
+    /**
+     * Submits a transfer and waits for the consumer to write it.
+     *
+     * Intake is asynchronous now: the endpoint answers 202 once the message is
+     * on the topic, and the entries appear only after the consumer processes
+     * it. These are read-path tests, so they need the write to have landed
+     * before they assert on it -- hence the wait, which is not part of what is
+     * under test here.
+     */
     private void transfer(long from, long to, String amount) throws Exception {
         String body = """
                 {"fromAccountId":%d,"toAccountId":%d,"amount":"%s","currency":"USD"}"""
                 .formatted(from, to, amount);
+
+        long entriesBefore = entryCount();
 
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/v1/transfers"))
                 .header("Content-Type", "application/json")
@@ -280,7 +340,19 @@ class AccountReadControllerTest extends AbstractPostgresTest {
                 .build();
 
         HttpResponse<String> response = CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-        assertThat(response.statusCode()).as("transfer failed: %s", response.body()).isEqualTo(201);
+        assertThat(response.statusCode()).as("transfer failed: %s", response.body()).isEqualTo(202);
+
+        long deadline = System.currentTimeMillis() + Duration.ofSeconds(30).toMillis();
+        while (System.currentTimeMillis() < deadline && entryCount() < entriesBefore + 2) {
+            Thread.sleep(100);
+        }
+        assertThat(entryCount())
+                .as("the consumer did not write the transfer in time")
+                .isEqualTo(entriesBefore + 2);
+    }
+
+    private long entryCount() {
+        return jdbc.queryForObject("SELECT count(*) FROM ledger_entries", Long.class);
     }
 
     private JsonNode getJson(String path) throws Exception {

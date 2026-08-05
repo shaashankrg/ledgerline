@@ -87,7 +87,9 @@ class TransactionProducerTest {
                 AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
 
         try (AdminClient admin = AdminClient.create(config)) {
-            admin.createTopics(List.of(new NewTopic(TOPIC, 1, (short) 1)))
+            // Three partitions, matching docker-compose. The same-key test below
+            // is only meaningful with more than one partition to choose from.
+            admin.createTopics(List.of(new NewTopic(TOPIC, 3, (short) 1)))
                     .all().get(30, TimeUnit.SECONDS);
         }
     }

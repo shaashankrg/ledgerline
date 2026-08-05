@@ -2,25 +2,23 @@ package com.ledgerline.api;
 
 import java.math.BigDecimal;
 
-import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
 
 /**
  * The POST /api/v1/transfers response body.
  *
- * Identical in shape and content for an original and its replay -- the only
- * difference between the two responses is the Idempotent-Replay header, so a
- * client never has to branch on whether its retry was the one that won.
+ * Acknowledges that the transfer was accepted for processing, not that it has
+ * been recorded. The ledger row does not exist yet when this is returned, so
+ * there is no database-generated id to report -- transactionId is the
+ * client-supplied Idempotency-Key, which is what the consumer will use to write
+ * the entries and what the client can look the transfer up by afterwards.
+ *
+ * That makes the id a String here rather than the numeric ledger id the
+ * synchronous path used to return.
  */
 public record TransferResponseBody(
 
-        /*
-         * Serialized as a string for the same reason as the amount: a JSON
-         * number would be parsed into a double by a JS client, and ids beyond
-         * 2^53 would silently lose their low bits.
-         */
-        @JsonFormat(shape = JsonFormat.Shape.STRING)
-        long transactionId,
+        String transactionId,
 
         Long fromAccountId,
 

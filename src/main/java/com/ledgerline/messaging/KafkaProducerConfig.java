@@ -61,10 +61,25 @@ class KafkaProducerConfig {
         config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
         config.put(ProducerConfig.RETRIES_CONFIG, Integer.MAX_VALUE);
 
-        // Bounds the total time spent retrying before the send is failed, so a
-        // caller cannot block indefinitely on an unreachable broker.
-        config.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120_000);
-        config.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 30_000);
+        /*
+         * Bounds the total time spent retrying before the send is failed.
+         *
+         * This now sits on the synchronous HTTP path, so it doubles as the
+         * ceiling on how long a request can wait before the endpoint answers
+         * 503. Kept comfortably under the controller's own publish timeout so
+         * the producer is what gives up first, with a real error, rather than
+         * the controller abandoning a send that might still succeed.
+         */
+        config.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 8_000);
+        config.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 4_000);
+
+        /*
+         * Caps the wait for cluster metadata, which happens before a record is
+         * ever queued and is therefore not covered by delivery.timeout.ms. An
+         * unreachable broker blocks here first, so without this the send would
+         * sit for the default 60s regardless of the timeouts above.
+         */
+        config.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 5_000);
 
         // Required to be <= 5 for idempotence to preserve ordering on retry.
         config.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);

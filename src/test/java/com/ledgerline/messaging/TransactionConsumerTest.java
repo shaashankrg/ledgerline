@@ -49,6 +49,9 @@ import com.ledgerline.transfer.TransferService;
 @SpringBootTest
 class TransactionConsumerTest {
 
+    /** Matches docker-compose. */
+    static final int PARTITIONS = 3;
+
     private static final ConfluentKafkaContainer KAFKA =
             new ConfluentKafkaContainer("confluentinc/cp-kafka:7.8.0");
     private static final PostgreSQLContainer<?> POSTGRES =
@@ -68,7 +71,7 @@ class TransactionConsumerTest {
 
         try (AdminClient admin = AdminClient.create(config)) {
             admin.createTopics(List.of(
-                    new NewTopic(TransactionProducer.TOPIC, 1, (short) 1),
+                    new NewTopic(TransactionProducer.TOPIC, PARTITIONS, (short) 1),
                     new NewTopic(DeadLetterPublisher.DLT_TOPIC, 1, (short) 1)))
                     .all().get(30, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
@@ -184,7 +187,11 @@ class TransactionConsumerTest {
     @Test
     void recordRedeliveredAfterOffsetRewindIsNotWrittenTwice() throws Exception {
         String transactionId = UUID.randomUUID().toString();
-        publish(transactionId, message(transactionId, alice, bob, "50.00", "USD"));
+        // The partition this record landed on, rather than an assumed one --
+        // the key decides it, and earlier tests have left committed offsets on
+        // the others.
+        TopicPartition written = publishAndLocate(
+                transactionId, message(transactionId, alice, bob, "50.00", "USD"));
 
         await().atMost(Duration.ofSeconds(30)).until(() -> entryCount() == 2);
         await().atMost(Duration.ofSeconds(30))
@@ -195,7 +202,7 @@ class TransactionConsumerTest {
         // Stop the listener so the group is free, rewind, then restart it.
         MessageListenerContainer container = listenerContainer();
         container.stop();
-        rewindOffsetTo(offsetBeforeRewind - 1);
+        rewindOneRecordOn(written);
         container.start();
 
         // Wait for the rewound record to be consumed again and re-committed.
@@ -291,12 +298,47 @@ class TransactionConsumerTest {
      * stopped before this is called; with it running, this consumer would take
      * the partition away from it.
      */
-    private void rewindOffsetTo(long offset) {
-        Map<String, Object> config = consumerConfig(KafkaConsumerConfig.GROUP_ID);
-        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(config)) {
-            TopicPartition partition = new TopicPartition(TransactionProducer.TOPIC, 0);
-            consumer.assign(List.of(partition));
-            consumer.commitSync(Map.of(partition, new OffsetAndMetadata(offset)));
+    private void rewindOneRecordOn(TopicPartition target) {
+        Map<String, Object> config = Map.of(
+                AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
+
+        try (AdminClient admin = AdminClient.create(config)) {
+            OffsetAndMetadata committed = admin
+                    .listConsumerGroupOffsets(KafkaConsumerConfig.GROUP_ID)
+                    .partitionsToOffsetAndMetadata()
+                    .get(30, TimeUnit.SECONDS)
+                    .get(target);
+
+            if (committed == null || committed.offset() == 0) {
+                throw new IllegalStateException("nothing committed on " + target + " to rewind");
+            }
+
+            Map<String, Object> consumerConfig = consumerConfig(KafkaConsumerConfig.GROUP_ID);
+            try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(consumerConfig)) {
+                consumer.assign(List.of(target));
+                consumer.commitSync(Map.of(target, new OffsetAndMetadata(committed.offset() - 1)));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        } catch (Exception e) {
+            throw new IllegalStateException("could not rewind offset", e);
+        }
+    }
+
+    /** Publishes and reports which partition the record landed on. */
+    private TopicPartition publishAndLocate(String key, String payload) {
+        try {
+            var metadata = deadLetterKafkaTemplate
+                    .send(TransactionProducer.TOPIC, key, payload)
+                    .get(30, TimeUnit.SECONDS)
+                    .getRecordMetadata();
+            return new TopicPartition(metadata.topic(), metadata.partition());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
         }
     }
 
@@ -308,18 +350,27 @@ class TransactionConsumerTest {
      * partition away from the listener under test, and report offsets for a
      * group it had just disrupted. AdminClient only queries.
      */
+    /**
+     * Total committed offsets across every partition of the topic.
+     *
+     * Summed rather than read from partition 0, because the topic has three
+     * partitions and a keyed record lands on whichever one its key hashes to.
+     * The total still answers the only question these tests ask: how many
+     * records the group has committed.
+     */
     private long committedOffset(String topic) {
         Map<String, Object> config = Map.of(
                 AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
 
         try (AdminClient admin = AdminClient.create(config)) {
-            TopicPartition partition = new TopicPartition(topic, 0);
-            OffsetAndMetadata committed = admin
+            return admin
                     .listConsumerGroupOffsets(KafkaConsumerConfig.GROUP_ID)
                     .partitionsToOffsetAndMetadata()
                     .get(30, TimeUnit.SECONDS)
-                    .get(partition);
-            return committed == null ? 0 : committed.offset();
+                    .entrySet().stream()
+                    .filter(entry -> entry.getKey().topic().equals(topic))
+                    .mapToLong(entry -> entry.getValue().offset())
+                    .sum();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(e);

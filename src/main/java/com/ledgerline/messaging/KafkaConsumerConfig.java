@@ -77,11 +77,17 @@ class KafkaConsumerConfig {
 
     @Bean
     ConcurrentKafkaListenerContainerFactory<String, String> transactionListenerContainerFactory(
-            ConsumerFactory<String, String> transactionConsumerFactory) {
+            ConsumerFactory<String, String> transactionConsumerFactory,
+            @Value("${ledgerline.consumer.concurrency:1}") int concurrency) {
 
         ConcurrentKafkaListenerContainerFactory<String, String> factory =
                 new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory(transactionConsumerFactory);
+
+        // Each unit of concurrency is a separate consumer in the group, so this
+        // is how many partitions can be worked in parallel. Capped by the
+        // partition count: extra consumers beyond it sit idle.
+        factory.setConcurrency(concurrency);
 
         /*
          * MANUAL_IMMEDIATE: the commit is issued the moment acknowledge() is

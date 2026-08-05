@@ -41,6 +41,9 @@ public final class ErrorTypes {
     /** Pagination cursor was not a token this service issued. */
     public static final URI MALFORMED_CURSOR = URI.create(BASE + "malformed-cursor");
 
+    /** The transfer could not be accepted for processing; retrying is safe. */
+    public static final URI INTAKE_UNAVAILABLE = URI.create(BASE + "intake-unavailable");
+
     /** Anything unhandled. Carries a correlation id and no detail. */
     public static final URI INTERNAL_ERROR = URI.create(BASE + "internal-error");
 

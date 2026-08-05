@@ -1,6 +1,7 @@
 package com.ledgerline.api;
 
 import java.net.URI;
+import java.util.concurrent.TimeUnit;
 
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -11,41 +12,56 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import com.ledgerline.transfer.TransferRequest;
-import com.ledgerline.transfer.TransferResult;
-import com.ledgerline.transfer.TransferService;
+import com.ledgerline.messaging.TransactionMessage;
+import com.ledgerline.messaging.TransactionProducer;
 
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 
 /**
- * HTTP adapter over {@link TransferService}.
+ * Intake for transfers. Publishes to Kafka and writes nothing.
  *
- * Deliberately thin: it reads the header and body, hands them to the service,
- * and shapes the result. No validation, transaction handling, or idempotency
- * logic lives here -- all of that belongs to the service, which is also what
- * makes the service usable from a non-HTTP caller later.
+ * The endpoint no longer touches the database. Writing to Postgres here and
+ * publishing to Kafka would be a dual write: two systems, no shared
+ * transaction, so a crash between them leaves the ledger and the topic
+ * disagreeing with no way to tell which is right. Publishing only, and letting
+ * the consumer be the sole writer, removes that failure entirely -- there is
+ * one system of record and one path into it.
+ *
+ * Validation here is shape only: whether the JSON parses, the fields are
+ * present, the amount is positive and fits the ledger's scale. Everything that
+ * needs state -- the accounts existing, their currencies agreeing -- is checked
+ * by TransferService when the consumer processes the message. That is a real
+ * consequence, not an oversight: a request naming a nonexistent account is
+ * accepted with 202 and fails later into the dead letter topic, because at
+ * intake time there is nothing to check it against.
  */
 @RestController
 @RequestMapping("/api/v1/transfers")
 @Validated // makes @NotBlank on the header parameter take effect
 class TransferController {
 
-    /** Signals to the client that this response replays an earlier request. */
-    static final String REPLAY_HEADER = "Idempotent-Replay";
+    /** How long to wait for the broker to acknowledge before giving up. */
+    private static final long PUBLISH_TIMEOUT_SECONDS = 10;
 
-    private final TransferService transferService;
+    private final TransactionProducer transactionProducer;
 
-    TransferController(TransferService transferService) {
-        this.transferService = transferService;
+    TransferController(TransactionProducer transactionProducer) {
+        this.transactionProducer = transactionProducer;
     }
 
     /**
-     * Records a transfer, or replays one already recorded under the same key.
+     * Accepts a transfer for processing.
      *
-     * A replay returns the same 201 and the same body as the original. Returning
-     * a different status for a retry would force every client to branch on it,
-     * which defeats the point of the request being idempotent.
+     * Returns 202, not 201: nothing has been created yet. The ledger entries
+     * appear once the consumer processes the message, so claiming creation here
+     * would be a lie the client could observe by immediately reading back.
+     *
+     * There is no replay header any more. The producer holds no state and
+     * cannot know whether this key was used before -- only the consumer, which
+     * has the database, can tell a retry from a first attempt. A duplicate
+     * submission publishes a second message and is deduplicated downstream, so
+     * both requests get an identical 202 and the client never has to branch.
      */
     @PostMapping
     ResponseEntity<TransferResponseBody> transfer(
@@ -54,27 +70,58 @@ class TransferController {
             String idempotencyKey,
             @Valid @RequestBody TransferRequestBody body) {
 
-        TransferResult result = transferService.transfer(new TransferRequest(
+        TransactionMessage message = new TransactionMessage(
                 idempotencyKey,
-                body.fromAccountId(),
-                body.toAccountId(),
-                body.amount(),
-                body.currency()));
-
-        TransferResponseBody responseBody = new TransferResponseBody(
-                result.transactionId(),
                 body.fromAccountId(),
                 body.toAccountId(),
                 body.amount(),
                 body.currency());
 
-        ResponseEntity.BodyBuilder response = ResponseEntity
-                .created(URI.create("/api/v1/transfers/" + result.transactionId()));
+        publish(message);
 
-        if (result.replayed()) {
-            response.header(REPLAY_HEADER, "true");
+        TransferResponseBody responseBody = new TransferResponseBody(
+                idempotencyKey,
+                body.fromAccountId(),
+                body.toAccountId(),
+                body.amount(),
+                body.currency());
+
+        return ResponseEntity
+                .accepted()
+                .location(URI.create("/api/v1/transfers/" + idempotencyKey))
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(responseBody);
+    }
+
+    /**
+     * Waits for the broker to acknowledge before responding.
+     *
+     * Blocking rather than fire-and-forget: a 202 has to mean the message is
+     * durably on the topic. Returning before the acknowledgement would tell the
+     * client the transfer was accepted when it might still be lost, which is
+     * precisely the ambiguity this design exists to remove.
+     */
+    private void publish(TransactionMessage message) {
+        try {
+            transactionProducer.publish(message).get(PUBLISH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new TransferPublishException(e);
+        } catch (Exception e) {
+            throw new TransferPublishException(e);
         }
+    }
 
-        return response.contentType(MediaType.APPLICATION_JSON).body(responseBody);
+    /**
+     * The message could not be published.
+     *
+     * Maps to 503. Nothing was written anywhere, so the client can retry the
+     * same request with the same key safely -- which is the whole reason the
+     * endpoint does not write to the database first.
+     */
+    static class TransferPublishException extends RuntimeException {
+        TransferPublishException(Throwable cause) {
+            super("could not publish the transfer", cause);
+        }
     }
 }

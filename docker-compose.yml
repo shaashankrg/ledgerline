@@ -73,17 +73,21 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    # One partition each: ordering is per-partition in Kafka, and a single
-    # partition is the simplest way to keep every transaction message globally
-    # ordered while the pipeline is being built.
+    # Three partitions on transactions, so more than one consumer in the group
+    # can make progress and rebalancing is a real event rather than a no-op.
+    # The ledger does not depend on cross-partition ordering: every transfer is
+    # a self-contained balanced pair keyed by its own transaction id, and a
+    # balance is a SUM, which does not care what order it accumulates in.
     #
     # transactions.DLT holds messages that can never be processed. It is created
     # up front rather than on first failure, so the consumer is never publishing
-    # a dead letter to a topic that does not exist yet.
+    # a dead letter to a topic that does not exist yet. It stays at one
+    # partition: nothing consumes it automatically, and keeping failures in one
+    # place makes them easier to read.
     command: >
       bash -c "
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
-      --topic transactions --partitions 1 --replication-factor 1 &&
+      --topic transactions --partitions 3 --replication-factor 1 &&
       kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
       --topic transactions.DLT --partitions 1 --replication-factor 1
       "

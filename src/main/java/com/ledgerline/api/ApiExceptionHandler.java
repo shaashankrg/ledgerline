@@ -134,6 +134,29 @@ class ApiExceptionHandler {
     }
 
     /**
+     * 503, and deliberately not 500.
+     *
+     * The publish failed, which means nothing was written to the ledger and
+     * nothing reached the topic. The request left no trace, so retrying it with
+     * the same key is safe -- 503 tells the client exactly that, where a 500
+     * would leave it guessing whether the transfer had partly happened.
+     *
+     * The cause is logged rather than returned, for the same reason as any
+     * other server-side failure.
+     */
+    @ExceptionHandler(TransferController.TransferPublishException.class)
+    ProblemDetail handlePublishFailure(TransferController.TransferPublishException e) {
+        String correlationId = UUID.randomUUID().toString();
+        log.error("Transfer intake unavailable, correlationId={}", correlationId, e);
+
+        ProblemDetail problem = problem(HttpStatus.SERVICE_UNAVAILABLE, ErrorTypes.INTAKE_UNAVAILABLE,
+                "Transfer intake unavailable",
+                "The transfer could not be accepted. Nothing was recorded, so the request may be retried.");
+        problem.setProperty("correlationId", correlationId);
+        return problem;
+    }
+
+    /**
      * A cursor the service did not issue is a client error, not a server one --
      * without this it would surface as a decode failure and a 500.
      */
