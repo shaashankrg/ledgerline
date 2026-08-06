@@ -1,4 +1,4 @@
-package com.ledgerline.transfer;
+package com.ledgerline.domain;
 
 /**
  * An idempotency key was reused for a materially different request.

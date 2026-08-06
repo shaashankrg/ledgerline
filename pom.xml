@@ -99,6 +99,35 @@
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
 			</plugin>
+			<!-- Coverage, so the state machine's branch number is measured rather
+			     than estimated. Scoped to the domain package: it is pure logic
+			     with no I/O, so 100% is both achievable and meaningful there,
+			     which is not true of the layers that talk to Postgres or Kafka. -->
+			<plugin>
+				<groupId>org.jacoco</groupId>
+				<artifactId>jacoco-maven-plugin</artifactId>
+				<version>0.8.12</version>
+				<configuration>
+					<includes>
+						<include>com/ledgerline/domain/**</include>
+					</includes>
+				</configuration>
+				<executions>
+					<execution>
+						<id>prepare-agent</id>
+						<goals>
+							<goal>prepare-agent</goal>
+						</goals>
+					</execution>
+					<execution>
+						<id>report</id>
+						<phase>test</phase>
+						<goals>
+							<goal>report</goal>
+						</goals>
+					</execution>
+				</executions>
+			</plugin>
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-surefire-plugin</artifactId>
@@ -109,7 +138,11 @@
 					     Testcontainers reads that as "no Docker available". Asking
 					     for a version above the floor lets it connect; the client
 					     then negotiates the daemon's actual version. -->
-					<argLine>-Dapi.version=1.43</argLine>
+					<!-- @{argLine} carries whatever JaCoCo's prepare-agent set.
+					     Without it, this property would replace the agent flag
+					     instead of adding to it, and coverage would silently
+					     report zero. -->
+					<argLine>@{argLine} -Dapi.version=1.43</argLine>
 				</configuration>
 			</plugin>
 		</plugins>

@@ -81,6 +81,7 @@ class RebalanceAndOrderingTest {
     void setUp() {
         jdbc.update("DELETE FROM ledger_entries");
         jdbc.update("DELETE FROM transactions");
+        jdbc.update("DELETE FROM transaction_states");
 
         alice = accountId("Alice Checking");
         bob = accountId("Bob Checking");
@@ -137,7 +138,9 @@ class RebalanceAndOrderingTest {
                 .isNotEmpty()
                 .allMatch(count -> count == 2);
 
-        assertThat(transactionCount()).isEqualTo(transferCount);
+        // Two transaction rows per legacy message: an implicit AUTHORIZE and
+        // its CAPTURE, each claiming its own idempotency_key.
+        assertThat(transactionCount()).isEqualTo(transferCount * 2L);
         assertThat(entryCount()).isEqualTo(transferCount * 2L);
 
         // The ledger invariant still holds across the whole set.

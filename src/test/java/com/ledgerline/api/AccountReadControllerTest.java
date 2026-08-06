@@ -30,9 +30,12 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.kafka.ConfluentKafkaContainer;
 
+import org.springframework.kafka.core.KafkaTemplate;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ledgerline.AbstractPostgresTest;
+import com.ledgerline.domain.EventType;
 
 /**
  * Full-stack tests for the read endpoints, over real HTTP and real Postgres.
@@ -75,6 +78,9 @@ class AccountReadControllerTest extends AbstractPostgresTest {
     @Autowired
     private JdbcTemplate jdbc;
 
+    @Autowired
+    private KafkaTemplate<String, String> deadLetterKafkaTemplate;
+
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient CLIENT = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
@@ -94,6 +100,7 @@ class AccountReadControllerTest extends AbstractPostgresTest {
             try {
                 jdbc.update("DELETE FROM ledger_entries");
                 jdbc.update("DELETE FROM transactions");
+                jdbc.update("DELETE FROM transaction_states");
                 break;
             } catch (DataIntegrityViolationException e) {
                 if (System.currentTimeMillis() > deadline) {
@@ -318,29 +325,20 @@ class AccountReadControllerTest extends AbstractPostgresTest {
     }
 
     /**
-     * Submits a transfer and waits for the consumer to write it.
+     * Publishes a complete transfer's worth of events and waits for the
+     * consumer to write it.
      *
-     * Intake is asynchronous now: the endpoint answers 202 once the message is
-     * on the topic, and the entries appear only after the consumer processes
-     * it. These are read-path tests, so they need the write to have landed
-     * before they assert on it -- hence the wait, which is not part of what is
-     * under test here.
+     * There is no HTTP endpoint for this any more -- intake retired as a
+     * ledger writer, so these read-path tests publish directly, the same way
+     * production traffic now arrives. AUTHORIZE then CAPTURE: the pair that
+     * produces one balanced set of entries, which is all these tests need.
      */
     private void transfer(long from, long to, String amount) throws Exception {
-        String body = """
-                {"fromAccountId":%d,"toAccountId":%d,"amount":"%s","currency":"USD"}"""
-                .formatted(from, to, amount);
-
         long entriesBefore = entryCount();
+        String txn = UUID.randomUUID().toString();
 
-        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/v1/transfers"))
-                .header("Content-Type", "application/json")
-                .header("Idempotency-Key", UUID.randomUUID().toString())
-                .POST(HttpRequest.BodyPublishers.ofString(body))
-                .build();
-
-        HttpResponse<String> response = CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
-        assertThat(response.statusCode()).as("transfer failed: %s", response.body()).isEqualTo(202);
+        publish(txn, "auth", EventType.AUTHORIZE, from, to, amount);
+        publish(txn, "cap", EventType.CAPTURE, from, to, amount);
 
         long deadline = System.currentTimeMillis() + Duration.ofSeconds(30).toMillis();
         while (System.currentTimeMillis() < deadline && entryCount() < entriesBefore + 2) {
@@ -349,6 +347,16 @@ class AccountReadControllerTest extends AbstractPostgresTest {
         assertThat(entryCount())
                 .as("the consumer did not write the transfer in time")
                 .isEqualTo(entriesBefore + 2);
+    }
+
+    private void publish(String txn, String eventSuffix, EventType type,
+            long from, long to, String amount) throws Exception {
+        String body = """
+                {"transactionId":"%s","eventId":"%s","eventType":"%s",\
+                "fromAccountId":%d,"toAccountId":%d,"amount":"%s","currency":"USD"}"""
+                .formatted(txn, txn + ":" + eventSuffix, type, from, to, amount);
+
+        deadLetterKafkaTemplate.send(TRANSACTIONS_TOPIC, txn, body).get(30, TimeUnit.SECONDS);
     }
 
     private long entryCount() {

@@ -1,4 +1,4 @@
-package com.ledgerline.transfer;
+package com.ledgerline.domain;
 
 /** An account's currency does not match the currency declared on the request. */
 public class CurrencyMismatchException extends TransferException {

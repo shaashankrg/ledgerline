@@ -16,11 +16,6 @@ import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
-import com.ledgerline.transfer.AccountNotFoundException;
-import com.ledgerline.transfer.AmountScaleException;
-import com.ledgerline.transfer.CurrencyMismatchException;
-import com.ledgerline.transfer.IdempotencyKeyReuseException;
-import com.ledgerline.transfer.SameAccountTransferException;
 
 import jakarta.validation.ConstraintViolationException;
 
@@ -88,72 +83,19 @@ class ApiExceptionHandler {
                 "Malformed request", "The request body could not be parsed as valid JSON.");
     }
 
-    @ExceptionHandler(SameAccountTransferException.class)
-    ProblemDetail handleSameAccount(SameAccountTransferException e) {
-        return problem(HttpStatus.BAD_REQUEST, ErrorTypes.SAME_ACCOUNT,
-                "Invalid transfer", e.getMessage());
-    }
-
-    @ExceptionHandler(CurrencyMismatchException.class)
-    ProblemDetail handleCurrencyMismatch(CurrencyMismatchException e) {
-        return problem(HttpStatus.BAD_REQUEST, ErrorTypes.CURRENCY_MISMATCH,
-                "Currency mismatch", e.getMessage());
-    }
-
-    @ExceptionHandler(AmountScaleException.class)
-    ProblemDetail handleAmountScale(AmountScaleException e) {
-        return problem(HttpStatus.BAD_REQUEST, ErrorTypes.AMOUNT_SCALE,
-                "Invalid amount", e.getMessage());
-    }
-
     /**
-     * 422 rather than 400: the request is syntactically fine and the client
-     * cannot fix it by reformatting -- the referenced account does not exist.
-     */
-    @ExceptionHandler(AccountNotFoundException.class)
-    ProblemDetail handleAccountNotFound(AccountNotFoundException e) {
-        return problem(HttpStatus.UNPROCESSABLE_ENTITY, ErrorTypes.ACCOUNT_NOT_FOUND,
-                "Account not found", e.getMessage());
-    }
-
-    @ExceptionHandler(IdempotencyKeyReuseException.class)
-    ProblemDetail handleKeyReuse(IdempotencyKeyReuseException e) {
-        return problem(HttpStatus.UNPROCESSABLE_ENTITY, ErrorTypes.IDEMPOTENCY_KEY_REUSE,
-                "Idempotency key reuse", e.getMessage());
-    }
-
-    /**
-     * 404 rather than the transfer layer's 422: on a read the account is the
-     * resource being addressed, so its absence is a missing resource rather
-     * than an unprocessable request.
+     * The read path's only 404.
+     *
+     * The business exceptions (same account, unknown account, currency
+     * mismatch, amount scale, key reuse) no longer have handlers here: the
+     * transfer endpoint that raised them is retired, and the Kafka path that
+     * raises them now routes them to the dead letter topic instead of to an
+     * HTTP response.
      */
     @ExceptionHandler(AccountReadController.AccountNotFoundInReadException.class)
     ProblemDetail handleAccountMissingOnRead(AccountReadController.AccountNotFoundInReadException e) {
         return problem(HttpStatus.NOT_FOUND, ErrorTypes.RESOURCE_NOT_FOUND,
                 "Account not found", e.getMessage());
-    }
-
-    /**
-     * 503, and deliberately not 500.
-     *
-     * The publish failed, which means nothing was written to the ledger and
-     * nothing reached the topic. The request left no trace, so retrying it with
-     * the same key is safe -- 503 tells the client exactly that, where a 500
-     * would leave it guessing whether the transfer had partly happened.
-     *
-     * The cause is logged rather than returned, for the same reason as any
-     * other server-side failure.
-     */
-    @ExceptionHandler(TransferController.TransferPublishException.class)
-    ProblemDetail handlePublishFailure(TransferController.TransferPublishException e) {
-        String correlationId = UUID.randomUUID().toString();
-        log.error("Transfer intake unavailable, correlationId={}", correlationId, e);
-
-        ProblemDetail problem = problem(HttpStatus.SERVICE_UNAVAILABLE, ErrorTypes.INTAKE_UNAVAILABLE,
-                "Transfer intake unavailable",
-                "The transfer could not be accepted. Nothing was recorded, so the request may be retried.");
-        problem.setProperty("correlationId", correlationId);
-        return problem;
     }
 
     /**

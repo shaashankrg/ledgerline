@@ -1,4 +1,4 @@
-package com.ledgerline.transfer;
+package com.ledgerline.domain;
 
 /** Source and destination are the same account. */
 public class SameAccountTransferException extends TransferException {

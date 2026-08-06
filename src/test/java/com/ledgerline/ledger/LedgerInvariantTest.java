@@ -4,9 +4,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
+import org.assertj.core.api.SoftAssertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -14,17 +16,29 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import com.ledgerline.AbstractPostgresTest;
+import com.ledgerline.domain.EventType;
+import com.ledgerline.domain.TransactionEvent;
+import com.ledgerline.transfer.TransactionEventService;
 
 /**
  * The test that should stay green for the life of the project.
  *
- * Asserts the ledger invariant at two levels, and pins the Day 2 schema
- * constraints so a future loosening of them fails here.
+ * Asserts the ledger invariant against TransactionEventService, the only
+ * component that writes to the ledger in production. An earlier version of
+ * this test wrote through LedgerWriter.recordTransfer directly, which meant it
+ * was exercising a path nothing in the running system actually calls -- a
+ * rogue writer bypassing the event service entirely could have broken the
+ * invariant here and this test would never have seen it.
+ *
+ * Also pins the Day 2 schema constraints (zero amount, unknown transaction,
+ * unknown account, duplicate idempotency key), which are properties of the
+ * table and are asserted directly against raw SQL rather than through any
+ * particular write path.
  */
 class LedgerInvariantTest extends AbstractPostgresTest {
 
     @Autowired
-    private LedgerWriter ledgerWriter;
+    private TransactionEventService eventService;
 
     @Autowired
     private JdbcTemplate jdbc;
@@ -39,6 +53,7 @@ class LedgerInvariantTest extends AbstractPostgresTest {
         // Entries reference transactions, so they go first.
         jdbc.update("DELETE FROM ledger_entries");
         jdbc.update("DELETE FROM transactions");
+        jdbc.update("DELETE FROM transaction_states");
 
         alice = accountId("Alice Checking");
         bob = accountId("Bob Checking");
@@ -48,12 +63,19 @@ class LedgerInvariantTest extends AbstractPostgresTest {
 
     @Test
     void ledgerStaysBalancedAfterTransfers() {
-        ledgerWriter.recordTransfer(alice, bob, new BigDecimal("50.00"), key());
-        ledgerWriter.recordTransfer(bob, carol, new BigDecimal("20.00"), key());
-        ledgerWriter.recordTransfer(carol, reservePool, new BigDecimal("12.3456"), key());
+        transfer(alice, bob, "50.00");
+        transfer(bob, carol, "20.00");
+        transfer(carol, reservePool, "12.3456");
 
-        assertSystemWideBalance();
-        assertEveryTransactionBalances();
+        // alice:  -50.00
+        // bob:    +50.00 - 20.00 = +30.00
+        // carol:  +20.00 - 12.3456 = +7.6544
+        // reservePool: +12.3456
+        assertBalancesAndInvariant(
+                balance(alice, "-50.00"),
+                balance(bob, "30.00"),
+                balance(carol, "7.6544"),
+                balance(reservePool, "12.3456"));
     }
 
     /**
@@ -63,39 +85,44 @@ class LedgerInvariantTest extends AbstractPostgresTest {
      */
     @Test
     void ledgerStaysBalancedForAmountsFloatingPointCannotRepresent() {
-        ledgerWriter.recordTransfer(alice, bob, new BigDecimal("0.10"), key());
-        ledgerWriter.recordTransfer(alice, bob, new BigDecimal("0.20"), key());
-        ledgerWriter.recordTransfer(bob, carol, new BigDecimal("0.30"), key());
-        ledgerWriter.recordTransfer(carol, alice, new BigDecimal("0.0001"), key());
+        transfer(alice, bob, "0.10");
+        transfer(alice, bob, "0.20");
+        transfer(bob, carol, "0.30");
+        transfer(carol, alice, "0.0001");
 
-        assertSystemWideBalance();
-        assertEveryTransactionBalances();
+        // alice: -0.10 - 0.20 + 0.0001 = -0.2999
+        // bob:   +0.10 + 0.20 - 0.30 = 0
+        // carol: +0.30 - 0.0001 = 0.2999
+        assertBalancesAndInvariant(
+                balance(alice, "-0.2999"),
+                balance(bob, "0"),
+                balance(carol, "0.2999"));
     }
 
     @Test
     void balanceHoldsAcrossManyTransfers() {
         for (int i = 0; i < 100; i++) {
-            ledgerWriter.recordTransfer(alice, bob, new BigDecimal("1.01"), key());
+            transfer(alice, bob, "1.01");
         }
 
-        assertSystemWideBalance();
-        assertEveryTransactionBalances();
+        assertBalancesAndInvariant(
+                balance(alice, "-101.00"),
+                balance(bob, "101.00"));
         assertThat(entryCount()).isEqualTo(200);
     }
 
     /**
-     * A transfer that fails partway must leave nothing behind. The credit here
-     * targets a nonexistent account, so the foreign key rejects it after the
-     * debit has already been inserted -- the rollback is what keeps a lone
-     * debit out of the table.
+     * A transfer naming a nonexistent account must leave nothing behind.
+     * EventValidator rejects the AUTHORIZE before anything is written, so
+     * unlike the raw-SQL cases below this never reaches the foreign key --
+     * the whole point is that a missing account is caught earlier than that.
      */
     @Test
     void failedTransferLeavesNoPartialEntries() {
         long missingAccount = 999_999L;
 
-        assertThatExceptionOfType(DataIntegrityViolationException.class)
-                .isThrownBy(() -> ledgerWriter.recordTransfer(
-                        alice, missingAccount, new BigDecimal("50.00"), key()));
+        assertThatExceptionOfType(RuntimeException.class)
+                .isThrownBy(() -> transfer(alice, missingAccount, "50.00"));
 
         assertThat(entryCount()).isZero();
         assertThat(jdbc.queryForObject("SELECT count(*) FROM transactions", Long.class)).isZero();
@@ -104,17 +131,21 @@ class LedgerInvariantTest extends AbstractPostgresTest {
     }
 
     @Test
-    void duplicateIdempotencyKeyIsRejected() {
-        String reusedKey = key();
-        ledgerWriter.recordTransfer(alice, bob, new BigDecimal("50.00"), reusedKey);
+    void duplicateEventIdIsRejected() {
+        String key = key();
+        transfer(alice, bob, "50.00", key);
 
-        assertThatExceptionOfType(DataIntegrityViolationException.class)
-                .isThrownBy(() -> ledgerWriter.recordTransfer(
-                        bob, carol, new BigDecimal("10.00"), reusedKey));
+        // Same eventId, different amount: the payload hash rejects it before
+        // any second entry could be written.
+        assertThatExceptionOfType(RuntimeException.class)
+                .isThrownBy(() -> transfer(bob, carol, "10.00", key));
 
-        // The rejected retry contributed nothing, so only the original pair remains.
-        assertThat(entryCount()).isEqualTo(2);
-        assertSystemWideBalance();
+        // The rejected retry contributed nothing, so only the original pair
+        // is there, and it is on the accounts the original named -- not carol.
+        assertBalancesAndInvariant(
+                balance(alice, "-50.00"),
+                balance(bob, "50.00"),
+                balance(carol, "0"));
     }
 
     @Test
@@ -139,24 +170,86 @@ class LedgerInvariantTest extends AbstractPostgresTest {
                 .isThrownBy(() -> insertRawEntry(transactionId, 999_999L, new BigDecimal("10.00")));
     }
 
-    /** Every entry in the table sums to exactly zero. */
-    private void assertSystemWideBalance() {
-        BigDecimal systemTotal = jdbc.queryForObject(
-                "SELECT COALESCE(SUM(amount), 0) FROM ledger_entries", BigDecimal.class);
+    /**
+     * Asserts every named account balance, then the invariant, in one soft
+     * block so a failure anywhere does not hide a failure elsewhere.
+     *
+     * Order matters when assertions differ in strength. Per-account balance is
+     * the strongest claim here: two entries on the wrong accounts still sum to
+     * zero, so a plain sum-to-zero check cannot catch misdirected money and
+     * must not be allowed to report "pass" while masking a balance failure
+     * behind it. Soft assertions remove the ordering hazard entirely -- every
+     * check runs and every failure is reported, so which one is "first" stops
+     * mattering.
+     */
+    private void assertBalancesAndInvariant(AccountBalance... expected) {
+        SoftAssertions softly = new SoftAssertions();
 
-        // isEqualByComparingTo, not isEqualTo: BigDecimal equality counts scale,
-        // so 0.0000 does not equal ZERO despite being the same number.
-        assertThat(systemTotal).isEqualByComparingTo(BigDecimal.ZERO);
+        for (AccountBalance each : expected) {
+            softly.assertThat(balanceOf(each.accountId()))
+                    .as("balance of account %d", each.accountId())
+                    .isEqualByComparingTo(each.expectedAmount());
+        }
+
+        softly.assertThat(systemBalance())
+                .as("system-wide sum of ledger_entries")
+                .isEqualByComparingTo(BigDecimal.ZERO);
+
+        softly.assertThat(unbalancedTransactions())
+                .as("transactions whose entries do not sum to zero")
+                .isEmpty();
+
+        softly.assertAll();
     }
 
-    /** No individual transaction is unbalanced. */
+    private void assertSystemWideBalance() {
+        assertThat(systemBalance()).isEqualByComparingTo(BigDecimal.ZERO);
+    }
+
     private void assertEveryTransactionBalances() {
-        List<Long> unbalanced = jdbc.queryForList(
+        assertThat(unbalancedTransactions()).isEmpty();
+    }
+
+    private BigDecimal systemBalance() {
+        return jdbc.queryForObject(
+                "SELECT COALESCE(SUM(amount), 0) FROM ledger_entries", BigDecimal.class);
+    }
+
+    private List<Long> unbalancedTransactions() {
+        return jdbc.queryForList(
                 "SELECT transaction_id FROM ledger_entries "
                         + "GROUP BY transaction_id HAVING SUM(amount) <> 0",
                 Long.class);
+    }
 
-        assertThat(unbalanced).isEmpty();
+    private BigDecimal balanceOf(long accountId) {
+        return jdbc.queryForObject(
+                "SELECT COALESCE(SUM(amount), 0) FROM ledger_entries WHERE account_id = ?",
+                BigDecimal.class, accountId);
+    }
+
+    private static AccountBalance balance(long accountId, String expectedAmount) {
+        return new AccountBalance(accountId, new BigDecimal(expectedAmount));
+    }
+
+    private record AccountBalance(long accountId, BigDecimal expectedAmount) {
+    }
+
+    /** AUTHORIZE then CAPTURE: the pair that writes one balanced set of entries. */
+    private void transfer(long from, long to, String amount) {
+        transfer(from, to, amount, key());
+    }
+
+    private void transfer(long from, long to, String amount, String externalTxnId) {
+        BigDecimal parsed = new BigDecimal(amount);
+        Instant now = Instant.now();
+
+        eventService.apply(new TransactionEvent(
+                externalTxnId, externalTxnId + ":AUTHORIZE", EventType.AUTHORIZE,
+                from, to, parsed, "USD", now));
+        eventService.apply(new TransactionEvent(
+                externalTxnId, externalTxnId + ":CAPTURE", EventType.CAPTURE,
+                from, to, parsed, "USD", now));
     }
 
     private long accountId(String name) {
@@ -173,7 +266,7 @@ class LedgerInvariantTest extends AbstractPostgresTest {
                 Long.class, key());
     }
 
-    /** Bypasses LedgerWriter to poke the schema constraints directly. */
+    /** Bypasses the write path to poke the schema constraints directly. */
     private void insertRawEntry(long transactionId, long accountId, BigDecimal amount) {
         jdbc.update("INSERT INTO ledger_entries (transaction_id, account_id, amount) VALUES (?, ?, ?)",
                 transactionId, accountId, amount);

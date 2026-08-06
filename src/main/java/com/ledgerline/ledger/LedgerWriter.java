@@ -1,6 +1,7 @@
 package com.ledgerline.ledger;
 
 import java.math.BigDecimal;
+import java.util.Optional;
 
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
@@ -8,6 +9,10 @@ import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+
+import com.ledgerline.domain.EntryGroup;
+import com.ledgerline.domain.IdempotencyKeyReuseException;
+import com.ledgerline.domain.LedgerEntry;
 
 /**
  * Minimal write path for balanced transactions.
@@ -61,6 +66,104 @@ public class LedgerWriter {
         // construction: same magnitude, opposite signs.
         insertEntry(transactionId, fromAccountId, amount.negate());
         insertEntry(transactionId, toAccountId, amount);
+    }
+
+    /**
+     * Writes an already-balanced group of entries against an existing
+     * transaction row.
+     *
+     * The general form of {@link #recordEntries}: that one builds a two-sided
+     * pair from a single amount, this one writes whatever set the caller has
+     * produced. Used by the event path, where an event's entries come from
+     * EntryPolicy rather than from a from/to/amount triple.
+     *
+     * The group's own constructor has already enforced that it balances, so
+     * there is no second check here -- re-verifying it would imply the type
+     * could be constructed unbalanced, which it cannot.
+     */
+    @Transactional
+    public void recordEntryGroup(long transactionId, EntryGroup group) {
+        for (LedgerEntry entry : group.entries()) {
+            insertEntry(transactionId, entry.accountId(), entry.amount());
+        }
+    }
+
+    /**
+     * Claims an event id, creating the transaction row that entries hang off.
+     *
+     * The idempotency mechanism carried over from the retired transfer path,
+     * unchanged in substance. Written as INSERT ... ON CONFLICT DO NOTHING
+     * rather than SELECT-then-INSERT because two concurrent deliveries of one
+     * event can both pass a pre-check and both go on to write entries; letting
+     * the unique index arbitrate means exactly one can win, whatever the
+     * interleaving.
+     *
+     * What changed is only what the key identifies. It was one transfer; it is
+     * now one event, so a capture and a later refund of the same transaction
+     * claim separate rows. The constraint keeps meaning "this message was
+     * applied once", which is what it always meant.
+     *
+     * @return the new row id, or empty if this event id was already claimed
+     */
+    @Transactional
+    public Optional<Long> claimEvent(String eventId, String payloadHash, String description) {
+        // RETURNING yields no row when the conflict clause suppresses the
+        // insert, which is precisely the "someone else won" signal.
+        return jdbc.query(
+                "INSERT INTO transactions (idempotency_key, payload_hash, description) "
+                        + "VALUES (:eventId, :payloadHash, :description) "
+                        + "ON CONFLICT (idempotency_key) DO NOTHING "
+                        + "RETURNING id",
+                new MapSqlParameterSource()
+                        .addValue("eventId", eventId)
+                        .addValue("payloadHash", payloadHash)
+                        .addValue("description", description),
+                rs -> rs.next() ? Optional.of(rs.getLong("id")) : Optional.<Long>empty());
+    }
+
+    /**
+     * Verifies a claimed event id was used for this same payload.
+     *
+     * A redelivery carries an identical payload and is harmless. A different
+     * payload under the same id means the producer reused the key for
+     * something else, and honouring either reading would be wrong: returning
+     * the original silently drops the new event, writing a new one breaks the
+     * key's promise.
+     *
+     * @throws IdempotencyKeyReuseException when the stored hash differs
+     */
+    @Transactional(readOnly = true)
+    public void requireMatchingPayload(String eventId, String payloadHash) {
+        String storedHash = jdbc.queryForObject(
+                "SELECT payload_hash FROM transactions WHERE idempotency_key = :eventId",
+                new MapSqlParameterSource("eventId", eventId),
+                String.class);
+
+        // A row written without a hash cannot be shown to match, and treating
+        // an absent hash as a match would let any payload replay it.
+        if (storedHash == null || !storedHash.trim().equals(payloadHash)) {
+            throw new IdempotencyKeyReuseException(eventId);
+        }
+    }
+
+    /**
+     * Releases an idempotency claim taken by an event that was not applied.
+     *
+     * Used when an event is parked rather than processed: it has claimed its
+     * key but written nothing, and leaving the claim in place would make the
+     * event look already-applied when it eventually drains, silently skipping
+     * it. Deleting the row returns the key to unclaimed so the drain can take
+     * it for real.
+     *
+     * Safe because a claimed-but-unapplied row has no entries hanging off it --
+     * the foreign key would refuse the delete otherwise, which is a useful
+     * second opinion on that invariant.
+     */
+    @Transactional
+    public void releaseClaim(String eventId) {
+        jdbc.update(
+                "DELETE FROM transactions WHERE idempotency_key = :eventId",
+                new MapSqlParameterSource("eventId", eventId));
     }
 
     private long insertTransaction(String idempotencyKey) {

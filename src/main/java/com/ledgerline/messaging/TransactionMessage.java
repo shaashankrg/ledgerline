@@ -4,6 +4,7 @@ import java.math.BigDecimal;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.ledgerline.domain.EventType;
 
 /**
  * A transaction published to the {@code transactions} topic.
@@ -18,6 +19,25 @@ import com.fasterxml.jackson.databind.annotation.JsonSerialize;
 public record TransactionMessage(
 
         String transactionId,
+
+        /**
+         * Identifies this one event within the transaction's lifecycle.
+         *
+         * A transaction is a sequence of events sharing a transactionId, so the
+         * transactionId alone cannot deduplicate a message -- five events
+         * legitimately carry the same one. This is what the idempotency claim
+         * is keyed on.
+         *
+         * Null is tolerated for messages predating the event model, and the
+         * parser derives one; see TransactionMessageParser.
+         */
+        String eventId,
+
+        /**
+         * What happened. Null is read as CAPTURE, which is what a message
+         * carrying a complete movement and no lifecycle information means.
+         */
+        EventType eventType,
 
         @JsonFormat(shape = JsonFormat.Shape.STRING)
         Long fromAccountId,

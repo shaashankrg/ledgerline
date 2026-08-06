@@ -1,4 +1,4 @@
-package com.ledgerline.transfer;
+package com.ledgerline.domain;
 
 /**
  * Base type for transfer rejections, so Day 5's HTTP layer can catch one type

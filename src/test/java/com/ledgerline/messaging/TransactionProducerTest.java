@@ -30,6 +30,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.kafka.ConfluentKafkaContainer;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.ledgerline.domain.EventType;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
@@ -96,8 +97,7 @@ class TransactionProducerTest {
 
     @Test
     void messageRoundTripsWithEveryFieldIntact() throws Exception {
-        TransactionMessage sent = new TransactionMessage(
-                UUID.randomUUID().toString(), 1L, 2L, new BigDecimal("50.00"), "USD");
+        TransactionMessage sent = new TransactionMessage(UUID.randomUUID().toString(), UUID.randomUUID().toString(), EventType.CAPTURE, 1L, 2L, new BigDecimal("50.00"), "USD");
 
         producer.publish(sent).get(30, TimeUnit.SECONDS);
 
@@ -116,8 +116,7 @@ class TransactionProducerTest {
     @Test
     void amountRoundTripsExactlyAsAString() throws Exception {
         BigDecimal exact = new BigDecimal("1234567.89");
-        TransactionMessage sent = new TransactionMessage(
-                UUID.randomUUID().toString(), 1L, 2L, exact, "USD");
+        TransactionMessage sent = new TransactionMessage(UUID.randomUUID().toString(), UUID.randomUUID().toString(), EventType.CAPTURE, 1L, 2L, exact, "USD");
 
         producer.publish(sent).get(30, TimeUnit.SECONDS);
 
@@ -146,8 +145,7 @@ class TransactionProducerTest {
     @Test
     void valueBeyondDoublePrecisionSurvives() throws Exception {
         BigDecimal beyondDouble = new BigDecimal("9007199254740993.1234");
-        TransactionMessage sent = new TransactionMessage(
-                UUID.randomUUID().toString(), 1L, 2L, beyondDouble, "USD");
+        TransactionMessage sent = new TransactionMessage(UUID.randomUUID().toString(), UUID.randomUUID().toString(), EventType.CAPTURE, 1L, 2L, beyondDouble, "USD");
 
         producer.publish(sent).get(30, TimeUnit.SECONDS);
 
@@ -169,8 +167,7 @@ class TransactionProducerTest {
         int messageCount = 10;
 
         for (int i = 0; i < messageCount; i++) {
-            producer.publish(new TransactionMessage(
-                    sharedKey, 1L, 2L, new BigDecimal("1.00"), "USD"))
+            producer.publish(new TransactionMessage(sharedKey, UUID.randomUUID().toString(), EventType.CAPTURE, 1L, 2L, new BigDecimal("1.00"), "USD"))
                     .get(30, TimeUnit.SECONDS);
         }
 

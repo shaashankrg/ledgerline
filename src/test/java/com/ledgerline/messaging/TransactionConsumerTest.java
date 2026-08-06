@@ -37,7 +37,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.kafka.ConfluentKafkaContainer;
 
-import com.ledgerline.transfer.TransferService;
+import com.ledgerline.transfer.TransactionEventService;
 
 /**
  * Consumer tests against a real broker and a real Postgres.
@@ -101,7 +101,7 @@ class TransactionConsumerTest {
 
     @Autowired
     @SuppressWarnings("unused") // asserts the consumer did not take over its job
-    private TransferService transferService;
+    private TransactionEventService eventService;
 
     private long alice;
     private long bob;
@@ -113,6 +113,9 @@ class TransactionConsumerTest {
     void setUp() {
         jdbc.update("DELETE FROM ledger_entries");
         jdbc.update("DELETE FROM transactions");
+        // Lifecycle state too, or a transaction id reused across tests would
+        // start from whatever state an earlier test left it in.
+        jdbc.update("DELETE FROM transaction_states");
 
         // The DLT is read from the beginning in each test, so dead letters from
         // earlier tests would otherwise be counted again here.
@@ -173,7 +176,10 @@ class TransactionConsumerTest {
 
         // The replay wrote nothing, so the original pair is still all there is.
         assertThat(entryCount()).isEqualTo(2);
-        assertThat(transactionCount()).isEqualTo(1);
+        // Two transaction rows, not one: a legacy message with no eventType is
+        // read as AUTHORIZE followed by CAPTURE, each claiming its own row.
+        // The replay is of the whole record, so it adds neither.
+        assertThat(transactionCount()).isEqualTo(2);
         assertThat(balanceOf(alice)).isEqualByComparingTo(new BigDecimal("-50"));
     }
 
@@ -209,9 +215,10 @@ class TransactionConsumerTest {
         await().atMost(Duration.ofSeconds(30))
                 .until(() -> committedOffset(TransactionProducer.TOPIC) >= offsetBeforeRewind);
 
-        // Re-consumed and recognized as a replay: still one pair.
+        // Re-consumed and recognized as a replay: still one pair, still two
+        // transaction rows (AUTHORIZE, CAPTURE) from the original delivery.
         assertThat(entryCount()).isEqualTo(2);
-        assertThat(transactionCount()).isEqualTo(1);
+        assertThat(transactionCount()).isEqualTo(2);
     }
 
     /**
@@ -256,9 +263,12 @@ class TransactionConsumerTest {
         assertThat(headerOf(deadLettered.get(0), DeadLetterPublisher.EXCEPTION_HEADER))
                 .contains("IdempotencyKeyReuseException");
 
-        // The rejected message added nothing.
+        // The rejected message added nothing beyond the original delivery's
+        // two rows (AUTHORIZE, CAPTURE). Its own AUTHORIZE step is what
+        // collides first -- same eventId, different amount -- so its CAPTURE
+        // is never reached.
         assertThat(entryCount()).isEqualTo(2);
-        assertThat(transactionCount()).isEqualTo(1);
+        assertThat(transactionCount()).isEqualTo(2);
     }
 
     @Test

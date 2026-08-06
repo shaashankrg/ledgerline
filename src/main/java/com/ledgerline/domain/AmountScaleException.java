@@ -1,4 +1,4 @@
-package com.ledgerline.transfer;
+package com.ledgerline.domain;
 
 import java.math.BigDecimal;
 
