@@ -113,7 +113,7 @@ public class TransactionEventService {
 
         String payloadHash = EventPayloadHasher.hash(event);
         Optional<Long> claimedRowId = ledgerWriter.claimEvent(event.eventId(), payloadHash,
-                event.type() + " " + event.externalTxnId());
+                event.type() + " " + event.externalTxnId(), event.merchantId());
 
         if (claimedRowId.isEmpty()) {
             // Someone already applied this eventId. Either it is a genuine

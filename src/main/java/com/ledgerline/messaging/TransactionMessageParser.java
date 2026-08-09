@@ -93,7 +93,8 @@ class TransactionMessageParser {
                 message.toAccountId(),
                 message.amount(),
                 message.currency(),
-                occurredAt);
+                occurredAt,
+                message.merchantId());
     }
 
     /**

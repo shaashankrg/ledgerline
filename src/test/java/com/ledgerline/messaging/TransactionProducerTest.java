@@ -27,6 +27,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.kafka.ConfluentKafkaContainer;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -40,11 +41,36 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * bytes on the wire and the partition a key lands on, both of which are
  * properties of the real client and broker rather than of our code alone.
  *
- * This class does not extend AbstractPostgresTest -- the producer touches no
- * database, so starting Postgres for it would only slow the run.
+ * This class still doesn't extend AbstractPostgresTest -- the producer
+ * touches no database, so there's no reason to share that base class's
+ * container. But it does start its own ephemeral Postgres via
+ * {@code @DynamicPropertySource}, the same way TransactionGeneratorTest does:
+ * @SpringBootTest boots the *whole* application context regardless of what
+ * this class exercises, which means Flyway and JDBC bean wiring touch
+ * Postgres either way. Leaving that implicit -- falling through to
+ * application.properties' localhost:5432 default -- meant this class's
+ * result depended on whatever state a long-lived, shared local database
+ * happened to be in, which is the same failure class as a test that passes
+ * because it's asserting against a dead code path: a green result that isn't
+ * evidence. See docs/sabotage-log.md's schema-drift incident for what that
+ * cost in practice.
  */
 @SpringBootTest
 class TransactionProducerTest {
+
+    private static final PostgreSQLContainer<?> POSTGRES =
+            new PostgreSQLContainer<>("postgres:16");
+
+    static {
+        POSTGRES.start();
+    }
+
+    @DynamicPropertySource
+    static void postgresProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registry.add("spring.datasource.username", POSTGRES::getUsername);
+        registry.add("spring.datasource.password", POSTGRES::getPassword);
+    }
 
     private static final String TOPIC = TransactionProducer.TOPIC;
 

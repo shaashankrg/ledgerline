@@ -61,8 +61,36 @@ public class TransactionGenerator {
         Random random = new Random(config.seed());
 
         List<String> transactionIds = new ArrayList<>();
+        // The generator's own record of what it created, in creation order --
+        // NOT a record of what the Kafka send succeeded in transmitting. This
+        // is what the settlement simulator (Week 3) reads from, never the
+        // ledger, so that a bug anywhere in the consumer, state machine, or
+        // ledger writer shows up as a discrepancy against this independent
+        // record instead of being silently absent from both sides.
+        //
+        // Recorded before the send is attempted, and kept regardless of the
+        // send's outcome: a real card network settles a payment because it
+        // saw the authorization happen, not because our Kafka producer
+        // happened to succeed. If a send fails, the payment still occurred in
+        // the world this file models, so it still belongs in the settlement
+        // file -- that is precisely what makes a producer-side loss show up
+        // as a reconciliation discrepancy instead of vanishing from both
+        // sides of the comparison.
+        List<TransactionMessage> publishedRecord = new ArrayList<>();
         int publishedMessages = 0;
         int injectedFaults = 0;
+        // Counted, not just logged: an ERROR line is not something a later
+        // measurement can act on. Exposed on the result and, from there,
+        // persisted onto recon_batches, so a batch is self-describing --
+        // anything reading it later can tell whether the run that produced
+        // it was clean without needing the logs from the machine it ran on.
+        // Without this, a flaky broker during an accuracy sweep would
+        // produce a settlement row with no ledger entry and no ground-truth
+        // label (nobody injected it), which the engine correctly flags as
+        // MISSING_IN_LEDGER and which the harness would then score as a
+        // false positive, with nothing in the numbers to say it was actually
+        // infrastructure trouble.
+        int publishFailures = 0;
 
         long startNanos = System.nanoTime();
 
@@ -76,8 +104,20 @@ public class TransactionGenerator {
             }
 
             for (TransactionMessage message : plan.messages()) {
-                producer.publish(message).get(30, TimeUnit.SECONDS);
-                publishedMessages++;
+                publishedRecord.add(message);
+                try {
+                    producer.publish(message).get(30, TimeUnit.SECONDS);
+                    publishedMessages++;
+                } catch (Exception e) {
+                    // Not swallowed: a payment the world saw and our pipeline
+                    // failed to transmit must not also be invisible in the
+                    // logs, or the only trace of the loss would be the
+                    // settlement/ledger discrepancy itself, with nothing to
+                    // explain it.
+                    log.error("Failed to publish {} for transaction {}: {}",
+                            message.eventType(), message.transactionId(), e.toString());
+                    publishFailures++;
+                }
             }
 
             pace(config, startNanos, i + 1);
@@ -89,7 +129,8 @@ public class TransactionGenerator {
                 config.runId(), transactionIds.size(), publishedMessages, injectedFaults);
 
         return new GeneratorResult(
-                config.runId(), transactionIds, publishedMessages, injectedFaults);
+                config.runId(), transactionIds, publishedMessages, injectedFaults,
+                List.copyOf(publishedRecord), publishFailures);
     }
 
     /**
@@ -102,6 +143,17 @@ public class TransactionGenerator {
      */
     private TransactionPlan planTransaction(GeneratorConfig config, Random random, int index) {
         String externalTxnId = config.runId() + "-txn-" + index;
+
+        // Sub-seeded from (seed, index) -- the payment's position, not its
+        // externalTxnId, which embeds the run id and would make merchant
+        // assignment differ between two runs sharing a seed but not a run
+        // id. Not drawn from the shared random above either: this keeps
+        // merchant assignment independent of every fault-selection draw's
+        // position, so adding or changing it never shifts the sequence a
+        // previously recorded seed reproduces. See SyntheticMerchants' class
+        // comment for why the merchant has to be decided here, at creation,
+        // rather than by the settlement simulator.
+        String merchantId = SyntheticMerchants.merchantFor(config.seed(), index);
 
         long from = config.accountIds().get(random.nextInt(config.accountIds().size()));
         long to = from;
@@ -128,9 +180,9 @@ public class TransactionGenerator {
         List<InjectedFault> faults = new ArrayList<>();
 
         TransactionMessage authorize = message(
-                externalTxnId, EventType.AUTHORIZE, from, to, amount);
+                externalTxnId, EventType.AUTHORIZE, from, to, amount, merchantId);
         TransactionMessage capture = message(
-                externalTxnId, EventType.CAPTURE, from, to, amount);
+                externalTxnId, EventType.CAPTURE, from, to, amount, merchantId);
 
         // An orphan capture has no authorize at all, which subsumes any
         // ordering fault -- there is nothing for the capture to precede.
@@ -178,7 +230,7 @@ public class TransactionGenerator {
                         externalTxnId + ":SETTLE", amount, settledAmount));
             }
 
-            messages.add(message(externalTxnId, EventType.SETTLE, from, to, settledAmount));
+            messages.add(message(externalTxnId, EventType.SETTLE, from, to, settledAmount, merchantId));
         } else if (missingSettlement && !orphan) {
             faults.add(InjectedFault.of(config.runId(), FaultType.MISSING_SETTLEMENT,
                     externalTxnId, "captured but never settled"));
@@ -196,7 +248,7 @@ public class TransactionGenerator {
      * consumer's idempotency the thing under test.
      */
     private static TransactionMessage message(
-            String externalTxnId, EventType type, long from, long to, BigDecimal amount) {
+            String externalTxnId, EventType type, long from, long to, BigDecimal amount, String merchantId) {
         return new TransactionMessage(
                 externalTxnId,
                 externalTxnId + ":" + type.name(),
@@ -204,7 +256,8 @@ public class TransactionGenerator {
                 from,
                 to,
                 amount,
-                "USD");
+                "USD",
+                merchantId);
     }
 
     /** Holds the configured rate, if one was asked for. */
@@ -233,11 +286,24 @@ public class TransactionGenerator {
             Instant baseTime) {
     }
 
-    /** What a run produced. */
+    /**
+     * What a run produced.
+     *
+     * @param messages        every message actually created, in creation
+     *                        order, regardless of whether its send
+     *                        succeeded. The settlement simulator builds its
+     *                        "honest" network view from this list, never
+     *                        from the ledger -- see the class comment.
+     * @param publishFailures how many of those messages failed to send.
+     *                        Fail-soft: a failure here never aborts the run,
+     *                        it's recorded as a fact about the run instead.
+     */
     public record GeneratorResult(
             String runId,
             List<String> transactionIds,
             int publishedMessages,
-            int injectedFaults) {
+            int injectedFaults,
+            List<TransactionMessage> messages,
+            int publishFailures) {
     }
 }

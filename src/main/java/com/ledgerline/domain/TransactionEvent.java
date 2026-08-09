@@ -28,6 +28,13 @@ import java.util.Objects;
  * @param occurredAt    when the event happened at its source, not when it was
  *                      received. Ordering decisions must not depend on this:
  *                      a clock elsewhere is not a clock here.
+ * @param merchantId    which merchant this payment is for, if known. Passed
+ *                      through unchanged from the message that carried it;
+ *                      nothing here derives or validates it. Purely additive
+ *                      -- appended after occurredAt, with a non-canonical
+ *                      8-argument constructor below preserving every
+ *                      existing call site, rather than inserted among the
+ *                      original fields.
  */
 public record TransactionEvent(
         String externalTxnId,
@@ -37,12 +44,21 @@ public record TransactionEvent(
         Long toAccountId,
         BigDecimal amount,
         String currency,
-        Instant occurredAt) {
+        Instant occurredAt,
+        String merchantId) {
 
     public TransactionEvent {
         Objects.requireNonNull(externalTxnId, "externalTxnId");
         Objects.requireNonNull(eventId, "eventId");
         Objects.requireNonNull(type, "type");
+    }
+
+    /** Preserves every pre-existing 8-argument call site; merchantId defaults to null. */
+    public TransactionEvent(
+            String externalTxnId, String eventId, EventType type,
+            Long fromAccountId, Long toAccountId, BigDecimal amount,
+            String currency, Instant occurredAt) {
+        this(externalTxnId, eventId, type, fromAccountId, toAccountId, amount, currency, occurredAt, null);
     }
 
     /** True when this event carries a money movement to write. */

@@ -107,17 +107,31 @@ public class LedgerWriter {
      */
     @Transactional
     public Optional<Long> claimEvent(String eventId, String payloadHash, String description) {
+        return claimEvent(eventId, payloadHash, description, null);
+    }
+
+    /**
+     * Same as {@link #claimEvent(String, String, String)}, additionally
+     * recording which merchant the payment is for, if known.
+     *
+     * A purely additive column: nothing about the idempotency mechanism
+     * above changes. merchantId is passed through unvalidated -- whether it
+     * is a sensible value is the caller's business, same as description.
+     */
+    @Transactional
+    public Optional<Long> claimEvent(String eventId, String payloadHash, String description, String merchantId) {
         // RETURNING yields no row when the conflict clause suppresses the
         // insert, which is precisely the "someone else won" signal.
         return jdbc.query(
-                "INSERT INTO transactions (idempotency_key, payload_hash, description) "
-                        + "VALUES (:eventId, :payloadHash, :description) "
+                "INSERT INTO transactions (idempotency_key, payload_hash, description, merchant_id) "
+                        + "VALUES (:eventId, :payloadHash, :description, :merchantId) "
                         + "ON CONFLICT (idempotency_key) DO NOTHING "
                         + "RETURNING id",
                 new MapSqlParameterSource()
                         .addValue("eventId", eventId)
                         .addValue("payloadHash", payloadHash)
-                        .addValue("description", description),
+                        .addValue("description", description)
+                        .addValue("merchantId", merchantId),
                 rs -> rs.next() ? Optional.of(rs.getLong("id")) : Optional.<Long>empty());
     }
 

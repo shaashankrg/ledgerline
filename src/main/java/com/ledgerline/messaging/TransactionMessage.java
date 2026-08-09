@@ -54,5 +54,27 @@ public record TransactionMessage(
         @JsonSerialize(using = PlainDecimalMessageSerializer.class)
         BigDecimal amount,
 
-        String currency) {
+        String currency,
+
+        /**
+         * Which merchant this payment is for, if the publisher knows one.
+         *
+         * Nullable, and appended via a non-canonical constructor below rather
+         * than inserted among the original fields, specifically so every
+         * existing positional call site -- EmitTransactionCommand, every
+         * test that constructs a TransactionMessage directly -- keeps
+         * compiling unchanged. Added so a merchant identity can be an
+         * attribute of the payment itself, observable from both the
+         * settlement file and the ledger independently; see
+         * SyntheticMerchants and TransactionEventService for why a value
+         * only one side can derive is useless for reconciliation.
+         */
+        String merchantId) {
+
+    /** Preserves every pre-existing 7-argument call site; merchantId defaults to null. */
+    public TransactionMessage(
+            String transactionId, String eventId, EventType eventType,
+            Long fromAccountId, Long toAccountId, BigDecimal amount, String currency) {
+        this(transactionId, eventId, eventType, fromAccountId, toAccountId, amount, currency, null);
+    }
 }
