@@ -50,5 +50,29 @@ public enum NetworkFaultType {
      * A network error, or a payment we lost on our own side. Deliberately
      * has no corresponding captured payment at all.
      */
-    NETWORK_UNKNOWN_TXN
+    NETWORK_UNKNOWN_TXN,
+
+    /**
+     * Corrupt a row's external_txn_id while leaving every other field
+     * correct.
+     *
+     * Models a transmission or transcription error in the reference field
+     * alone: the payment is real, we captured it, and the amount, merchant,
+     * and settlement time the network reports are all right -- only the
+     * identifier is unusable.
+     *
+     * Deliberately distinct from {@link #NETWORK_UNKNOWN_TXN}, which they
+     * superficially resemble: both produce a row whose id resolves to
+     * nothing. The difference is what is behind it. An unknown-txn row
+     * points at a payment that does not exist, and the correct outcome is to
+     * report it unmatched. A mangled-id row points at a payment that *does*
+     * exist, and the correct outcome is to recover it by its other
+     * attributes. Reporting either as the other is a wrong answer, which is
+     * why they are separate types in the answer key rather than one
+     * "bad identifier" bucket.
+     *
+     * This is the fault the fuzzy matcher exists to recover, and until it
+     * existed the matcher had nothing to find in a generated batch.
+     */
+    NETWORK_MANGLED_TXN_ID
 }

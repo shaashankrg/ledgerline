@@ -61,6 +61,7 @@ class ReconciliationServiceTest extends AbstractPostgresTest {
     void setUp() {
         jdbc.update("DELETE FROM recon_line_outcomes");
         jdbc.update("DELETE FROM recon_exceptions");
+        jdbc.update("DELETE FROM recon_runs");
         jdbc.update("DELETE FROM settlement_records");
         jdbc.update("DELETE FROM recon_batches");
         jdbc.update("DELETE FROM ledger_entries");
@@ -130,15 +131,48 @@ class ReconciliationServiceTest extends AbstractPostgresTest {
                 Timestamp.from(SETTLED_AT));
     }
 
+    /**
+     * The recon_runs row for this batch at the default window. Exceptions and
+     * outcomes are keyed on the run, not the batch, since V12 -- a batch can
+     * have several runs, one per window.
+     */
+    private long runIdOf(String batchId) {
+        return runIdOf(batchId, ReconciliationService.DEFAULT_WINDOW_SECONDS);
+    }
+
+    private long runIdOf(String batchId, int windowSeconds) {
+        return jdbc.queryForObject(
+                "SELECT recon_run_id FROM recon_runs WHERE batch_id = ? AND window_seconds = ?",
+                Long.class, batchId, windowSeconds);
+    }
+
     private List<Map<String, Object>> exceptionsFor(String batchId, String type) {
         return jdbc.queryForList(
-                "SELECT * FROM recon_exceptions WHERE batch_id = ? AND type = ?", batchId, type);
+                "SELECT * FROM recon_exceptions WHERE recon_run_id = ? AND type = ?",
+                runIdOf(batchId), type);
     }
 
     private String outcomeOf(String batchId, int lineNumber) {
+        return outcomeOf(batchId, ReconciliationService.DEFAULT_WINDOW_SECONDS, lineNumber);
+    }
+
+    private String outcomeOf(String batchId, int windowSeconds, int lineNumber) {
         return jdbc.queryForObject(
-                "SELECT outcome FROM recon_line_outcomes WHERE batch_id = ? AND line_number = ?",
-                String.class, batchId, lineNumber);
+                "SELECT outcome FROM recon_line_outcomes WHERE recon_run_id = ? AND line_number = ?",
+                String.class, runIdOf(batchId, windowSeconds), lineNumber);
+    }
+
+    /** One outcome row, whole, for assertions over the pass-2 metadata columns. */
+    private Map<String, Object> outcomeRow(String batchId, int lineNumber) {
+        return jdbc.queryForMap(
+                "SELECT * FROM recon_line_outcomes WHERE recon_run_id = ? AND line_number = ?",
+                runIdOf(batchId), lineNumber);
+    }
+
+    private int countOutcome(String batchId, String outcome) {
+        return jdbc.queryForObject(
+                "SELECT count(*) FROM recon_line_outcomes WHERE recon_run_id = ? AND outcome = ?",
+                Integer.class, runIdOf(batchId), outcome);
     }
 
     // ---- One test per exception type -----------------------------------------
@@ -155,11 +189,12 @@ class ReconciliationServiceTest extends AbstractPostgresTest {
 
         assertThat(outcomeOf(batchId, 1)).isEqualTo("MATCHED");
         assertThat(jdbc.queryForObject(
-                "SELECT count(*) FROM recon_exceptions WHERE batch_id = ?", Integer.class, batchId))
+                "SELECT count(*) FROM recon_exceptions WHERE recon_run_id = ?",
+                Integer.class, runIdOf(batchId)))
                 .isZero();
         assertThat(jdbc.queryForObject(
-                "SELECT exception_id FROM recon_line_outcomes WHERE batch_id = ? AND line_number = 1",
-                Long.class, batchId))
+                "SELECT exception_id FROM recon_line_outcomes WHERE recon_run_id = ? AND line_number = 1",
+                Long.class, runIdOf(batchId)))
                 .isNull();
     }
 
@@ -194,8 +229,8 @@ class ReconciliationServiceTest extends AbstractPostgresTest {
 
         // No other exception type fires for this subject.
         assertThat(jdbc.queryForObject(
-                "SELECT count(*) FROM recon_exceptions WHERE batch_id = ? AND subject_key = ?",
-                Integer.class, batchId, runId + "-txn-999"))
+                "SELECT count(*) FROM recon_exceptions WHERE recon_run_id = ? AND subject_key = ?",
+                Integer.class, runIdOf(batchId),runId + "-txn-999"))
                 .isEqualTo(1);
     }
 
@@ -238,8 +273,8 @@ class ReconciliationServiceTest extends AbstractPostgresTest {
         // though the payment exists and agrees in amount -- duplication takes
         // precedence.
         assertThat(jdbc.queryForObject(
-                "SELECT count(*) FROM recon_exceptions WHERE batch_id = ? AND subject_key = ?",
-                Integer.class, batchId, runId + "-txn-1"))
+                "SELECT count(*) FROM recon_exceptions WHERE recon_run_id = ? AND subject_key = ?",
+                Integer.class, runIdOf(batchId),runId + "-txn-1"))
                 .isEqualTo(1);
     }
 
@@ -293,7 +328,8 @@ class ReconciliationServiceTest extends AbstractPostgresTest {
 
         // Produces no recon_line_outcomes row: there is no line to attach one to.
         assertThat(jdbc.queryForObject(
-                "SELECT count(*) FROM recon_line_outcomes WHERE batch_id = ?", Integer.class, batchId))
+                "SELECT count(*) FROM recon_line_outcomes WHERE recon_run_id = ?",
+                Integer.class, runIdOf(batchId)))
                 .isZero();
     }
 
@@ -336,8 +372,8 @@ class ReconciliationServiceTest extends AbstractPostgresTest {
         assertThat(exceptions.get(0).get("payment_state")).isEqualTo("REFUNDED");
 
         assertThat(jdbc.queryForObject(
-                "SELECT count(*) FROM recon_exceptions WHERE batch_id = ? AND type = 'AMOUNT_MISMATCH'",
-                Integer.class, batchId))
+                "SELECT count(*) FROM recon_exceptions WHERE recon_run_id = ? AND type = 'AMOUNT_MISMATCH'",
+                Integer.class, runIdOf(batchId)))
                 .isZero();
     }
 
@@ -434,12 +470,14 @@ class ReconciliationServiceTest extends AbstractPostgresTest {
         reconciliationService.run(batchId);
         List<String> exceptionsFirst = normalizedExceptionRows(batchId);
         List<Map<String, Object>> outcomesFirst = jdbc.queryForList(
-                "SELECT * FROM recon_line_outcomes WHERE batch_id = ? ORDER BY line_number", batchId);
+                "SELECT * FROM recon_line_outcomes WHERE recon_run_id = ? ORDER BY line_number",
+                runIdOf(batchId));
 
         reconciliationService.run(batchId);
         List<String> exceptionsSecond = normalizedExceptionRows(batchId);
         List<Map<String, Object>> outcomesSecond = jdbc.queryForList(
-                "SELECT * FROM recon_line_outcomes WHERE batch_id = ? ORDER BY line_number", batchId);
+                "SELECT * FROM recon_line_outcomes WHERE recon_run_id = ? ORDER BY line_number",
+                runIdOf(batchId));
 
         assertThat(exceptionsSecond).hasSameSizeAs(exceptionsFirst);
         assertThat(exceptionsSecond).isEqualTo(exceptionsFirst);
@@ -455,7 +493,7 @@ class ReconciliationServiceTest extends AbstractPostgresTest {
      */
     private List<String> normalizedExceptionRows(String batchId) {
         List<Map<String, Object>> rows = jdbc.queryForList(
-                "SELECT * FROM recon_exceptions WHERE batch_id = ? ORDER BY id", batchId);
+                "SELECT * FROM recon_exceptions WHERE recon_run_id = ? ORDER BY id", runIdOf(batchId));
         List<String> normalized = new java.util.ArrayList<>();
         for (Map<String, Object> row : rows) {
             normalized.add(normalizedExceptionRow(row));
@@ -513,16 +551,23 @@ class ReconciliationServiceTest extends AbstractPostgresTest {
         try (Connection connection = DriverManager.getConnection(
                 jdbcUrl(), "recon_role", "recon_role")) {
             try (var statement = connection.createStatement()) {
-                // Must not throw -- recon_role needs INSERT on its own tables.
+                // Must not throw -- recon_role needs INSERT on its own tables,
+                // including recon_runs since V12, because the matcher resolves
+                // or creates its own run row.
+                //
                 // Cleanup goes through the app's own JdbcTemplate, not this
                 // connection: recon_role is deliberately granted INSERT and
-                // SELECT only (V11), not DELETE, so this probe row is removed
-                // by setUp()'s next DELETE FROM recon_exceptions instead.
+                // SELECT only, not DELETE, so these probe rows are removed by
+                // setUp()'s next DELETE instead.
+                statement.execute(
+                        "INSERT INTO recon_runs (batch_id, window_seconds, matcher_version) "
+                                + "VALUES ('" + batchId + "', 3600, 'probe')");
                 statement.execute(
                         "INSERT INTO recon_exceptions "
-                                + "(batch_id, subject_key, type, external_txn_id, settlement_line_numbers) "
-                                + "VALUES ('" + batchId + "', 'probe-subject', 'MISSING_IN_LEDGER', "
-                                + "'probe-txn', ARRAY[1])");
+                                + "(recon_run_id, subject_key, type, external_txn_id, settlement_line_numbers) "
+                                + "SELECT recon_run_id, 'probe-subject', 'MISSING_IN_LEDGER', "
+                                + "'probe-txn', ARRAY[1] FROM recon_runs "
+                                + "WHERE batch_id = '" + batchId + "' AND matcher_version = 'probe'");
             }
         }
     }

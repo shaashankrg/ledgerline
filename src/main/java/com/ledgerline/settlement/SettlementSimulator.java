@@ -8,11 +8,13 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -197,6 +199,7 @@ public class SettlementSimulator {
         List<SettlementRow> drifted = select(pool, random, config.rateOf(NetworkFaultType.NETWORK_AMOUNT_DRIFT));
         List<SettlementRow> duplicated = select(pool, random, config.rateOf(NetworkFaultType.NETWORK_DUPLICATE_ROW));
         List<SettlementRow> lateSettled = select(pool, random, config.rateOf(NetworkFaultType.NETWORK_LATE_SETTLEMENT));
+        List<SettlementRow> mangled = select(pool, random, config.rateOf(NetworkFaultType.NETWORK_MANGLED_TXN_ID));
 
         List<SettlementRow> built = new ArrayList<>();
 
@@ -216,6 +219,18 @@ public class SettlementSimulator {
         for (SettlementRow row : lateSettled) {
             SettlementRow shifted = row.withSettledAt(row.settledAt().plus(lateSettlementShift(random)));
             built.add(shifted);
+        }
+
+        // Only the identifier is corrupted. Amount, merchant, and settled_at
+        // are carried through untouched, because a row that is wrong in more
+        // than one field is not recoverable by attribute and would therefore
+        // model a different fault entirely -- see NETWORK_MANGLED_TXN_ID.
+        List<MangledRow> mangledRows = new ArrayList<>();
+        for (SettlementRow row : mangled) {
+            String corrupted = mangleTxnId(random, row.externalTxnId(), honest);
+            SettlementRow written = row.withExternalTxnId(corrupted);
+            mangledRows.add(new MangledRow(row.externalTxnId(), written));
+            built.add(written);
         }
 
         // Everything left in the pool is untouched -- the honest row, verbatim.
@@ -243,6 +258,7 @@ public class SettlementSimulator {
         labelDrifted(config, drifted, built, faults);
         labelDuplicated(config, duplicated, faults);
         labelLateSettled(config, lateSettled, built, faults);
+        labelMangled(config, mangledRows, faults);
         labelUnknown(config, unknownRows, faults);
 
         finalRows.addAll(shuffle(config.seed(), built));
@@ -326,6 +342,123 @@ public class SettlementSimulator {
      * drift would have been a fixed, checkable arithmetic signature that
      * identified a drifted row without ever comparing it to the ledger.
      */
+    /**
+     * Corrupts a transaction id by transposing two adjacent characters.
+     *
+     * Transposition rather than nulling, chosen deliberately. A null id is
+     * also a legitimate shape -- settlement_records.external_txn_id is
+     * nullable precisely so the loader can represent an unparseable field --
+     * but it models a *parsing* failure, where the reference never survived
+     * into the file at all. Transposition models a transmission or
+     * transcription error, where an id is present and looks entirely
+     * plausible but resolves to nothing. That is the harder case for a
+     * matcher and the more common one in practice: a null is visibly absent,
+     * whereas a transposed id will pass any format check and fail only at
+     * lookup, which is exactly the situation pass 2 exists to handle.
+     *
+     * The digits are transposed, not the run-id prefix, so the result stays
+     * shaped like a real id from the same run and nothing about its format
+     * gives the fault away.
+     *
+     * The result is checked against every honest id in the run, and the
+     * search continues if it collides. A transposition that happened to
+     * land on another real transaction's id would silently convert this
+     * fault into something else entirely: the row would exact-match the
+     * wrong payment, and the answer key would claim a mangled id while the
+     * engine reported a perfectly ordinary match against a different
+     * transaction. Asserted rather than assumed, per the fault spec.
+     */
+    private String mangleTxnId(Random random, String externalTxnId, List<SettlementRow> honest) {
+        Set<String> realIds = new HashSet<>();
+        for (SettlementRow row : honest) {
+            realIds.add(row.externalTxnId());
+        }
+
+        // Only the trailing index digits are eligible: transposing inside the
+        // run-id prefix would produce an id that no longer belongs to this
+        // run, which reads as unknown-txn rather than mangled.
+        int lastDash = externalTxnId.lastIndexOf('-');
+        String prefix = externalTxnId.substring(0, lastDash + 1);
+        char[] digits = externalTxnId.substring(lastDash + 1).toCharArray();
+
+        if (digits.length >= 2) {
+            // Try each adjacent pair, starting from a seed-derived offset so
+            // the choice is deterministic but not always the same position.
+            int start = random.nextInt(digits.length - 1);
+            for (int attempt = 0; attempt < digits.length - 1; attempt++) {
+                int i = (start + attempt) % (digits.length - 1);
+                if (digits[i] == digits[i + 1]) {
+                    // Transposing equal characters is a no-op: the id would
+                    // come out unchanged and the row would match exactly,
+                    // producing no fault at all.
+                    continue;
+                }
+                char[] swapped = digits.clone();
+                char tmp = swapped[i];
+                swapped[i] = swapped[i + 1];
+                swapped[i + 1] = tmp;
+                String candidate = prefix + new String(swapped);
+                if (!realIds.contains(candidate)) {
+                    return candidate;
+                }
+            }
+        }
+
+        // Either too short to transpose, or every transposition was a no-op
+        // or collided with a real id. Append digits instead -- and check for
+        // collision here too.
+        //
+        // A single appended digit is not safe by itself: run-x-txn-1 with a
+        // 3 appended becomes run-x-txn-13, which is a real id the moment the
+        // run has 13 or more transactions -- reachable in any batch above
+        // roughly a dozen transactions, not an edge case. Caught by
+        // mangledIdRowIsRecoveredByFuzzyMatching exact-matching payments to
+        // the wrong id instead of fuzzy-recovering them, on a generated
+        // batch large enough for the collision to occur; a hand-built
+        // fixture never has enough ids in play to hit it, which is why this
+        // needed a generated-batch test to surface at all.
+        //
+        // Two appended digits (00-99) shrinks the same risk by two orders of
+        // magnitude but does not eliminate it in principle, so this still
+        // checks and still retries rather than trusting the range to be
+        // wide enough.
+        for (int suffix = 0; suffix < 100; suffix++) {
+            String candidate = externalTxnId + String.format("%02d", suffix);
+            if (!realIds.contains(candidate)) {
+                return candidate;
+            }
+        }
+
+        // A hundred two-digit appends and every adjacent transposition all
+        // collided. Only reachable with an implausibly dense id space for
+        // one run; fail loudly rather than silently return an id that
+        // collides after all.
+        throw new IllegalStateException(
+                "could not find a non-colliding mangled id for " + externalTxnId
+                        + " after exhausting transposition and append candidates");
+    }
+
+    /**
+     * A mangled row, paired with the id it originally carried.
+     *
+     * The original is kept because the answer key has to name the payment
+     * that was actually corrupted -- which is unrecoverable from the written
+     * row, since recovering it is precisely the matcher's job and the
+     * simulator must not do it for them.
+     */
+    private record MangledRow(String originalTxnId, SettlementRow written) {
+    }
+
+    private void labelMangled(
+            SettlementConfig config, List<MangledRow> mangledRows, List<NetworkFault> faults) {
+        for (MangledRow mangledRow : mangledRows) {
+            faults.add(NetworkFault.mangledTxnId(
+                    config.batchId(),
+                    mangledRow.originalTxnId(),
+                    mangledRow.written().externalTxnId()));
+        }
+    }
+
     private SettlementRow drift(Random random, SettlementRow row) {
         long minDelta = Math.max(1, (long) (row.grossAmountMinor() * 0.01));
         long maxDelta = Math.max(minDelta, (long) (row.grossAmountMinor() * 0.10));

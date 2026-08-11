@@ -121,5 +121,22 @@ class SettlementBatchRepository {
             return new NetworkFault(batchId, NetworkFaultType.NETWORK_DUPLICATE_ROW, txnId, null,
                     null, null, occurrences, "settled " + occurrences + " times in this batch");
         }
+
+        /**
+         * @param originalTxnId the real payment this row settles -- the
+         *                      ground truth a matcher is graded against
+         *                      recovering, not the string actually written
+         *                      to the file
+         * @param writtenTxnId  the corrupted id as it appears in the
+         *                      settlement file, kept in {@code detail} for
+         *                      diagnosis; not the fault's own identity,
+         *                      since {@link #externalTxnId} already carries
+         *                      that
+         */
+        static NetworkFault mangledTxnId(String batchId, String originalTxnId, String writtenTxnId) {
+            return new NetworkFault(batchId, NetworkFaultType.NETWORK_MANGLED_TXN_ID, originalTxnId, null,
+                    null, null, null,
+                    "original id " + originalTxnId + " written as " + writtenTxnId);
+        }
     }
 }

@@ -2,7 +2,10 @@ package com.ledgerline.reconciliation;
 
 import java.math.BigDecimal;
 import java.sql.ResultSet;
+import java.sql.Timestamp;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 
 import org.springframework.jdbc.core.RowMapper;
@@ -71,6 +74,87 @@ public class CapturedLedgerView {
                 WHERE ts.external_txn_id LIKE :runIdPrefix
                 """,
                 new MapSqlParameterSource("runIdPrefix", runId + "-%"),
+                CAPTURED_PAYMENT_MAPPER);
+    }
+
+    /**
+     * Payments that could plausibly be the one a settlement line describes,
+     * when the line's own identifier could not identify it.
+     *
+     * All three attributes must hold, and the amount comparison is exact --
+     * pass 2 relaxes *identity*, not *arithmetic*. A tolerance on the amount
+     * would let the matcher paper over an amount fault and a mangled id at
+     * the same time, reporting a confident match where two separate things
+     * went wrong.
+     *
+     * The exclusion list is the payments already claimed in this run,
+     * whether by pass 1's exact match or by an earlier fuzzy match in the
+     * same pass. A claimed payment is spoken for; offering it again is how a
+     * one-to-one matcher turns into a many-to-one one.
+     *
+     * ORDER BY is explicit and total (capture time, then id) rather than
+     * left to result-set order, so that "which candidate came first" is a
+     * property of the data and not of the plan Postgres happened to choose.
+     * Nothing downstream is allowed to *break a tie* by taking the first --
+     * see ReconOutcome.AMBIGUOUS -- but the ordering still has to be stable
+     * for a rerun to reach the same conclusion, and for the sabotage pass
+     * that removes ambiguity refusal to report a meaningful answer about
+     * which candidate a guessing matcher would have taken.
+     *
+     * @param runId          the generator run whose payments are in scope
+     * @param amountMinor    the settlement line's gross, in minor units
+     * @param merchantId     the settlement line's merchant
+     * @param settledAt      the settlement line's settled_at
+     * @param windowSeconds  half-width of the accepted capture-time window
+     * @param excludedTxnIds payments already claimed in this run; may be empty
+     */
+    public List<CapturedPayment> fuzzyCandidatesFor(
+            String runId, long amountMinor, String merchantId,
+            Instant settledAt, int windowSeconds, Collection<String> excludedTxnIds) {
+
+        // A never-matching sentinel keeps the NOT IN list non-empty; an empty
+        // IN () list is a syntax error in Postgres, and rewriting the query
+        // shape depending on whether exclusions exist would mean two query
+        // plans to reason about instead of one.
+        List<String> excluded = new ArrayList<>(excludedTxnIds);
+        excluded.add("");
+
+        return jdbc.query(
+                """
+                SELECT ts.external_txn_id AS external_txn_id,
+                       t.merchant_id AS merchant_id,
+                       e.amount AS captured_amount,
+                       a.currency AS currency,
+                       t.created_at AS captured_at,
+                       ts.state AS state
+                FROM transaction_states ts
+                JOIN transactions t
+                     ON t.idempotency_key = ts.external_txn_id || ':CAPTURE'
+                JOIN ledger_entries e
+                     ON e.transaction_id = t.id AND e.amount > 0
+                JOIN accounts a
+                     ON a.id = e.account_id
+                WHERE ts.external_txn_id LIKE :runIdPrefix
+                  AND t.merchant_id = :merchantId
+                  -- Mirrors toMinorUnits in ReconciliationService exactly:
+                  -- movePointRight(2) then HALF_UP to whole cents. Postgres
+                  -- ROUND on NUMERIC is half-up away from zero, matching
+                  -- BigDecimal.HALF_UP for the non-negative amounts a credit
+                  -- entry carries. A plain ::bigint cast would round
+                  -- half-to-even instead and disagree with the Java path on
+                  -- sub-cent amounts.
+                  AND ROUND(e.amount * 100)::bigint = :amountMinor
+                  AND t.created_at BETWEEN :windowStart AND :windowEnd
+                  AND ts.external_txn_id NOT IN (:excludedTxnIds)
+                ORDER BY t.created_at, ts.external_txn_id
+                """,
+                new MapSqlParameterSource()
+                        .addValue("runIdPrefix", runId + "-%")
+                        .addValue("merchantId", merchantId)
+                        .addValue("amountMinor", amountMinor)
+                        .addValue("windowStart", Timestamp.from(settledAt.minusSeconds(windowSeconds)))
+                        .addValue("windowEnd", Timestamp.from(settledAt.plusSeconds(windowSeconds)))
+                        .addValue("excludedTxnIds", excluded),
                 CAPTURED_PAYMENT_MAPPER);
     }
 

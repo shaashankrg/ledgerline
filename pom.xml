@@ -143,6 +143,32 @@
 					     instead of adding to it, and coverage would silently
 					     report zero. -->
 					<argLine>@{argLine} -Dapi.version=1.43</argLine>
+
+					<!-- Stated explicitly rather than left to surefire's defaults.
+					     Two classes in this repo have already been written, compiled,
+					     and committed without ever executing, because their names
+					     matched none of the default patterns (*Test, Test*, *Tests,
+					     *TestCase): a pair of Day 3 sabotage classes named *Probe.
+					     They passed review, passed compilation, and reported nothing,
+					     which is the worst possible failure mode for a test.
+
+					     The list below is deliberately broader than the default so
+					     that the plausible names someone reaches for (Probe, Spec,
+					     IT) are collected rather than silently dropped. Anything
+					     outside it is still invisible, which is why
+					     SurefireInclusionTest exists: it asserts that every
+					     @Test-bearing class under src/test/java matches one of these
+					     patterns, so a class named outside the list fails the build
+					     instead of disappearing from it. -->
+					<includes>
+						<include>**/*Test.java</include>
+						<include>**/Test*.java</include>
+						<include>**/*Tests.java</include>
+						<include>**/*TestCase.java</include>
+						<include>**/*Probe.java</include>
+						<include>**/*Spec.java</include>
+						<include>**/*IT.java</include>
+					</includes>
 				</configuration>
 			</plugin>
 		</plugins>

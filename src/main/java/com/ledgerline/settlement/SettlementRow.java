@@ -33,4 +33,17 @@ public record SettlementRow(
     public SettlementRow withSettledAt(Instant newSettledAt) {
         return new SettlementRow(externalTxnId, merchantId, grossAmountMinor, feeMinor, currency, newSettledAt);
     }
+
+    /**
+     * Replaces the transaction id, leaving every other field alone.
+     *
+     * Used by the NETWORK_MANGLED_TXN_ID fault, whose entire definition is
+     * "corrupt only the identifier" -- so the wither has to be able to
+     * change the id without touching the amount, merchant, or settlement
+     * time that make the row recoverable by attribute.
+     */
+    public SettlementRow withExternalTxnId(String newExternalTxnId) {
+        return new SettlementRow(
+                newExternalTxnId, merchantId, grossAmountMinor, feeMinor, currency, settledAt);
+    }
 }

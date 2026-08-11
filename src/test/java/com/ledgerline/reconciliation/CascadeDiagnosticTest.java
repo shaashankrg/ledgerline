@@ -55,8 +55,14 @@ class CascadeDiagnosticTest extends AbstractPostgresTest {
                         + "VALUES (?, 1, 'txn-1', 'merch-1', 1000, 20, 'USD', ?, 'raw')",
                 batchId, Timestamp.from(Instant.parse("2026-01-01T00:00:00Z")));
         jdbc.update(
-                "INSERT INTO recon_line_outcomes (batch_id, line_number, outcome) VALUES (?, 1, 'MATCHED')",
+                "INSERT INTO recon_runs (batch_id, window_seconds, matcher_version) "
+                        + "VALUES (?, 86400, 'cascade-probe')",
                 batchId);
+        jdbc.update(
+                "INSERT INTO recon_line_outcomes (recon_run_id, batch_id, line_number, outcome) "
+                        + "SELECT recon_run_id, ?, 1, 'MATCHED' FROM recon_runs "
+                        + "WHERE batch_id = ? AND matcher_version = 'cascade-probe'",
+                batchId, batchId);
 
         // recon_batches -> settlement_records has no cascade (V8, off limits).
         // This delete must fail outright, not silently orphan the outcome row
