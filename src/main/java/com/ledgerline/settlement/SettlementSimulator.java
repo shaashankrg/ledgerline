@@ -419,9 +419,13 @@ public class SettlementSimulator {
         // needed a generated-batch test to surface at all.
         //
         // Two appended digits (00-99) shrinks the same risk by two orders of
-        // magnitude but does not eliminate it in principle, so this still
-        // checks and still retries rather than trusting the range to be
-        // wide enough.
+        // magnitude but does not eliminate it in principle -- and for a
+        // single-digit index (txn-0..txn-9) it is not even small: appending
+        // "00".."99" to "txn-1" produces exactly txn-100..txn-199, which are
+        // *all* real ids in any run of 200 or more transactions, so this loop
+        // collided on every candidate deterministically rather than rarely.
+        // Checked and retried anyway rather than trusting the range to be
+        // wide enough, same as the transposition loop above.
         for (int suffix = 0; suffix < 100; suffix++) {
             String candidate = externalTxnId + String.format("%02d", suffix);
             if (!realIds.contains(candidate)) {
@@ -429,10 +433,20 @@ public class SettlementSimulator {
             }
         }
 
-        // A hundred two-digit appends and every adjacent transposition all
-        // collided. Only reachable with an implausibly dense id space for
-        // one run; fail loudly rather than silently return an id that
-        // collides after all.
+        // Every two-digit append collided too (the txn-1 case above). Widen
+        // to three digits (000-999) before giving up -- still checked and
+        // retried, not trusted blindly.
+        for (int suffix = 0; suffix < 1000; suffix++) {
+            String candidate = externalTxnId + String.format("%03d", suffix);
+            if (!realIds.contains(candidate)) {
+                return candidate;
+            }
+        }
+
+        // A thousand three-digit appends, a hundred two-digit appends, and
+        // every adjacent transposition all collided. Only reachable with an
+        // implausibly dense id space for one run; fail loudly rather than
+        // silently return an id that collides after all.
         throw new IllegalStateException(
                 "could not find a non-colliding mangled id for " + externalTxnId
                         + " after exhausting transposition and append candidates");
