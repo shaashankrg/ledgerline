@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-grafana-datasource
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+data:
+  prometheus.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://{{ .Release.Name }}-prometheus:9090
+        isDefault: true
+        editable: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-grafana-dashboard-provider
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+data:
+  ledgerline.yml: |
+    apiVersion: 1
+    providers:
+      - name: ledgerline
+        orgId: 1
+        folder: ""
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        allowUiUpdates: true
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-grafana-dashboards
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+data:
+  ledgerline.json: |
+{{ .Files.Get "files/dashboard.json" | indent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-grafana
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: {{ .Release.Name }}-grafana
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30030
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-grafana
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-grafana
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-grafana
+    spec:
+      containers:
+        - name: grafana
+          image: {{ .Values.observability.grafana.image }}
+          ports:
+            - containerPort: 3000
+          env:
+            # Anonymous admin access for local development only -- see
+            # docker-compose.yml's original comment, restated here since
+            # it's easy to lose sight of once buried in a Deployment spec.
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: Admin
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: "true"
+          volumeMounts:
+            - name: datasource
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+      volumes:
+        - name: datasource
+          configMap:
+            name: {{ .Release.Name }}-grafana-datasource
+        - name: dashboard-provider
+          configMap:
+            name: {{ .Release.Name }}-grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: {{ .Release.Name }}-grafana-dashboards

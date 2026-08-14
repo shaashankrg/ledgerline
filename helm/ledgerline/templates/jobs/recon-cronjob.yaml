@@ -1,0 +1,34 @@
+# Periodic, matching reconciliation's real-world cadence -- settlement
+# files arrive in batches, not continuously, so this runs on a schedule
+# rather than as a long-lived service. See
+# com.ledgerline.cli.ReconciliationRunCommand for what it actually does
+# (discovers and reconciles every recon_batches row with no matching
+# recon_runs row yet -- idempotent, so overlapping or repeated runs cost
+# nothing beyond a no-op).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-recon
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.recon.schedule | quote }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: recon
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - "--spring.profiles.active=recon"
+                - "--window-seconds={{ .Values.recon.windowSeconds }}"
+              envFrom:
+                - configMapRef:
+                    name: {{ .Release.Name }}-app-config
+                - secretRef:
+                    name: {{ .Release.Name }}-app-secret

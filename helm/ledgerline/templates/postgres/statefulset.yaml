@@ -1,0 +1,88 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Release.Name }}-postgres
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-3"
+type: Opaque
+stringData:
+  POSTGRES_DB: ledgerline
+  POSTGRES_USER: ledgerline
+  POSTGRES_PASSWORD: ledgerline
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ledgerline.postgresHost" . }}
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-3"
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Release.Name }}-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+# pre-install only, deliberately not pre-upgrade: Postgres/Kafka must exist
+# before the migration Job runs on first install, but on a later `helm
+# upgrade` they should keep running as the ordinary, persistent resources
+# they are (with their PVCs intact) rather than being torn down and
+# recreated by hook-delete-policy on every upgrade -- exactly the "survives
+# a pod restart" property Day 7 required a PVC for in the first place.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-postgres
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-3"
+spec:
+  serviceName: {{ include "ledgerline.postgresHost" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-postgres
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: {{ .Release.Name }}-postgres
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ledgerline", "-d", "ledgerline"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ledgerline", "-d", "ledgerline"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}

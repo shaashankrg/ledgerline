@@ -1,0 +1,71 @@
+# The entire demo's behavior is tunable from this one file -- nobody should
+# need to hand-edit a rendered template to change how the demo runs.
+
+image:
+  repository: ledgerline
+  tag: dev
+  # kind clusters have no network path to a local Docker daemon's image
+  # cache by default -- images have to be `kind load docker-image`'d in
+  # directly, which is what makes them "present on the node" without ever
+  # being pulled from a registry. IfNotPresent is what makes that loaded
+  # image actually get used instead of Kubernetes attempting (and failing)
+  # a registry pull for a tag no registry has.
+  pullPolicy: IfNotPresent
+
+processor:
+  replicaCount: 3
+  resources:
+    requests:
+      memory: "384Mi"
+      cpu: "250m"
+    limits:
+      memory: "768Mi"
+      cpu: "1000m"
+  consumer:
+    # Matches the topic's partition count by default -- see Day 6's finding
+    # that a single consumer thread serializing multiple partitions was the
+    # measured throughput bottleneck (tripling concurrency to match
+    # partition count gave ~2.5x drain-rate improvement, with the DB pool
+    # staying slack). Overridable independently of replicaCount: concurrency
+    # is per-pod thread count, replicaCount is pod count, and they answer
+    # different scaling questions.
+    concurrency: 1
+
+kafka:
+  partitions: 3
+  dltPartitions: 1
+
+postgres:
+  storage: 1Gi
+
+kafkaStorage: 1Gi
+
+# Reconciliation CronJob cadence -- periodic, matching its real-world nature
+# (settlement files arrive in batches, not continuously), not a long-running
+# service.
+recon:
+  schedule: "*/15 * * * *"
+  windowSeconds: 86400  # ReconciliationService.DEFAULT_WINDOW_SECONDS
+
+# The generator Job's tunables -- what Day 8 asks to be adjustable without
+# hand-editing templated YAML: generation rate, seed, fault rates, fuzzy
+# window (the last of which is actually recon.windowSeconds above, since
+# the fuzzy-match window is a property of a reconciliation *run*, not of
+# generation itself -- see ReconciliationService.run(batchId, windowSeconds)).
+generator:
+  enabled: true
+  seed: 42
+  transactionCount: 300
+  ratePerSecond: 20
+  faultRates:
+    duplicatePublish: 0.02
+    outOfOrder: 0.02
+    orphanCapture: 0.01
+    amountDrift: 0.02
+    missingSettlement: 0.02
+
+observability:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+  grafana:
+    image: grafana/grafana:11.4.0

@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerline-processor
+  namespace: ledgerline
+spec:
+  selector:
+    app: ledgerline-processor
+  ports:
+    - port: 8080
+      targetPort: 8080
+      # Only used in the raw-manifest (Day 7) setup, to expose the app on
+      # the kind node's mapped host port (see k8s/kind-config.yaml). The
+      # Helm chart's own Service (Day 8) does not need this -- Prometheus
+      # reaches pods by in-cluster Service DNS regardless.
+      nodePort: 30080
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledgerline-processor
+  namespace: ledgerline
+spec:
+  # 3 replicas is the Day 8 config this manifest anticipates, run here in
+  # Day 7's raw form specifically so the pipeline is proven working before
+  # any Helm templating sits on top of it -- see the Day 7/8 prompt's own
+  # note that Day 8 reconfigures what Day 7 already proved works.
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ledgerline-processor
+  template:
+    metadata:
+      labels:
+        app: ledgerline-processor
+    spec:
+      containers:
+        - name: processor
+          image: ledgerline:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: ledgerline-app-config
+            - secretRef:
+                name: ledgerline-app-secret
+          env:
+            # The processor never runs migrations itself -- see
+            # ledgerline-migrate above and application-migrate.properties'
+            # comment for why 3 replicas starting simultaneously must not
+            # each attempt Flyway's migration dance.
+            - name: SPRING_FLYWAY_ENABLED
+              value: "false"
+          resources:
+            requests:
+              memory: "384Mi"
+              cpu: "250m"
+            limits:
+              # Set comfortably above the JVM's own -Xmx512m (see
+              # Dockerfile's JAVA_TOOL_OPTIONS) so the container limit isn't
+              # the thing that kills the process before the JVM's own heap
+              # ceiling would -- off-heap usage (thread stacks, Kafka client
+              # buffers, JIT code cache) needs headroom beyond the heap
+              # figure alone.
+              memory: "768Mi"
+              cpu: "1000m"
+          # Liveness: is the JVM itself alive? Nothing about Kafka or the
+          # database factors in -- a database outage should not cause
+          # Kubernetes to kill and restart a process that would just hit the
+          # same outage again seconds later (that's what the consumer's own
+          # unlimited-retry backoff, see KafkaConsumerConfig, already
+          # handles correctly).
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          # Readiness: can this specific replica do useful work RIGHT NOW?
+          # Includes KafkaConsumerGroupHealth (see
+          # com.ledgerline.messaging.KafkaConsumerGroupHealth and the
+          # readiness group config in application.properties) -- this is
+          # what goes false the instant a rebalance starts revoking this
+          # replica's partitions, and true again once a new assignment
+          # settles. See KafkaConsumerGroupHealthRebalanceTest for the
+          # sabotage test proving this actually happens, not just that the
+          # endpoint exists.
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 3

@@ -92,7 +92,8 @@ class KafkaConsumerConfig {
     @Bean
     ConcurrentKafkaListenerContainerFactory<String, String> transactionListenerContainerFactory(
             ConsumerFactory<String, String> transactionConsumerFactory,
-            @Value("${ledgerline.consumer.concurrency:1}") int concurrency) {
+            @Value("${ledgerline.consumer.concurrency:1}") int concurrency,
+            KafkaConsumerGroupHealth consumerGroupHealth) {
 
         ConcurrentKafkaListenerContainerFactory<String, String> factory =
                 new ConcurrentKafkaListenerContainerFactory<>();
@@ -112,6 +113,18 @@ class KafkaConsumerConfig {
          * lag the truth for longer than necessary.
          */
         factory.getContainerProperties().setAckMode(AckMode.MANUAL_IMMEDIATE);
+
+        // The actual readiness signal (Day 8): registered as the container's
+        // own rebalance callback, so KafkaConsumerGroupHealth's state flips
+        // the instant the broker starts revoking this consumer's partitions,
+        // not on any timer or guess. See that class's Javadoc for why this
+        // has to be the real callback and not a proxy signal. With
+        // concurrency > 1, every consumer thread in this factory shares the
+        // same listener instance (it's one Spring bean), which is correct:
+        // "ready" should mean *this replica* holds at least one partition
+        // across all of its own consumer threads, not that one thread out of
+        // several happens to.
+        factory.getContainerProperties().setConsumerRebalanceListener(consumerGroupHealth);
 
         /*
          * Only transient failures reach here -- permanent ones are caught in the

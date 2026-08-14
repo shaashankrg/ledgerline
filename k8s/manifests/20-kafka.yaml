@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerline-kafka
+  namespace: ledgerline
+spec:
+  clusterIP: None
+  selector:
+    app: ledgerline-kafka
+  ports:
+    - name: plaintext
+      port: 9092
+      targetPort: 9092
+    - name: controller
+      port: 9093
+      targetPort: 9093
+    - name: internal
+      port: 29092
+      targetPort: 29092
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ledgerline-kafka
+  namespace: ledgerline
+spec:
+  serviceName: ledgerline-kafka
+  # Single-broker, deliberately -- Day 7 explicitly defers the multi-broker
+  # topology to Day 10. Fewer moving parts while the cluster plumbing itself
+  # is still being debugged; scaling this to 3 brokers is out of scope here.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ledgerline-kafka
+  template:
+    metadata:
+      labels:
+        app: ledgerline-kafka
+    spec:
+      containers:
+        - name: kafka
+          image: confluentinc/cp-kafka:7.8.0
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+            - containerPort: 29092
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: broker,controller
+            # Pod DNS name under the headless Service, matching
+            # docker-compose's `1@kafka:9093` shape but with the in-cluster
+            # equivalent hostname.
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:9093"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: CONTROLLER
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:29092"
+            # Advertised listener is the in-cluster Service DNS name now,
+            # not localhost -- this is the one line that has to change from
+            # docker-compose's shape for anything inside the cluster
+            # (the processor, the generator, kafka-init) to reach the broker
+            # by name.
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:9092,INTERNAL://ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:29092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: INTERNAL
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "false"
+            - name: CLUSTER_ID
+              value: "ZWRnZXJsaW5lTG9jYWwxMg"
+          volumeMounts:
+            - name: kafkadata
+              mountPath: /var/lib/kafka/data
+          # kafka-broker-api-versions is itself a JVM tool (it starts a real
+          # JVM to make one admin request), not a lightweight shell command --
+          # kubectl's exec probe default timeoutSeconds (1s) is not enough
+          # for the JVM to even finish starting, which was killing an
+          # otherwise-healthy broker on a false-negative liveness failure.
+          # Both probes need an explicit, longer timeout, not the default.
+          readinessProbe:
+            exec:
+              command: ["kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 10
+            failureThreshold: 20
+          livenessProbe:
+            exec:
+              command: ["kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 20
+  volumeClaimTemplates:
+    - metadata:
+        name: kafkadata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# One-shot topic creation -- the in-cluster equivalent of docker-compose's
+# kafka-init service. A Job rather than anything long-lived, matching the
+# original's `restart: "no"` shape exactly.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ledgerline-kafka-init
+  namespace: ledgerline
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      # Waits for the broker's own DNS record and admin port to actually
+      # answer before the real container ever runs -- StatefulSet Running
+      # does not imply the broker is accepting connections yet (KRaft
+      # startup, or plain DNS propagation for the pod's own hostname, can
+      # both still be in progress). Retrying via backoffLimit alone still
+      # works eventually, but burns through Job attempts and pod restarts
+      # on a condition that's cheap to wait out explicitly instead.
+      initContainers:
+        - name: wait-for-kafka
+          image: confluentinc/cp-kafka:7.8.0
+          command:
+            - bash
+            - -c
+            - |
+              until kafka-broker-api-versions --bootstrap-server ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:29092 > /dev/null 2>&1; do
+                echo "waiting for kafka broker..."
+                sleep 3
+              done
+      containers:
+        - name: kafka-init
+          image: confluentinc/cp-kafka:7.8.0
+          command:
+            - bash
+            - -c
+            - |
+              kafka-topics --bootstrap-server ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:29092 \
+                --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1 && \
+              kafka-topics --bootstrap-server ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:29092 \
+                --create --if-not-exists --topic transactions.DLT --partitions 1 --replication-factor 1

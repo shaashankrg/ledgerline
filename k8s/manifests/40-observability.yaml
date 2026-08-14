@@ -1,0 +1,207 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ledgerline-prometheus
+  namespace: ledgerline
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ledgerline-prometheus
+  namespace: ledgerline
+rules:
+  # Kubernetes service-discovery (kubernetes_sd_configs) needs to list pods
+  # and endpoints in this namespace to find every processor replica on its
+  # own -- a static single-target config (what the docker-compose setup
+  # used, one host, one target) would only ever see one of the 3 replicas
+  # once Day 8's Deployment is in play.
+  - apiGroups: [""]
+    resources: ["pods", "endpoints", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ledgerline-prometheus
+  namespace: ledgerline
+subjects:
+  - kind: ServiceAccount
+    name: ledgerline-prometheus
+    namespace: ledgerline
+roleRef:
+  kind: Role
+  name: ledgerline-prometheus
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ledgerline-prometheus-config
+  namespace: ledgerline
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+
+    scrape_configs:
+      - job_name: ledgerline
+        metrics_path: /actuator/prometheus
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ["ledgerline"]
+        relabel_configs:
+          # Only scrape pods labelled app=ledgerline-processor -- Postgres,
+          # Kafka, and Prometheus/Grafana's own pods would otherwise all be
+          # discovered too and scraped for a /actuator/prometheus path none
+          # of them expose.
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: ledgerline-processor
+          - source_labels: [__meta_kubernetes_pod_ip]
+            target_label: __address__
+            replacement: "${1}:8080"
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerline-prometheus
+  namespace: ledgerline
+spec:
+  selector:
+    app: ledgerline-prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+      nodePort: 30090
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledgerline-prometheus
+  namespace: ledgerline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ledgerline-prometheus
+  template:
+    metadata:
+      labels:
+        app: ledgerline-prometheus
+    spec:
+      serviceAccountName: ledgerline-prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: ledgerline-prometheus-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ledgerline-grafana-datasource
+  namespace: ledgerline
+data:
+  prometheus.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://ledgerline-prometheus:9090
+        isDefault: true
+        editable: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ledgerline-grafana-dashboard-provider
+  namespace: ledgerline
+data:
+  ledgerline.yml: |
+    apiVersion: 1
+    providers:
+      - name: ledgerline
+        orgId: 1
+        folder: ""
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        allowUiUpdates: true
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerline-grafana
+  namespace: ledgerline
+spec:
+  selector:
+    app: ledgerline-grafana
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30030
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledgerline-grafana
+  namespace: ledgerline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ledgerline-grafana
+  template:
+    metadata:
+      labels:
+        app: ledgerline-grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.4.0
+          ports:
+            - containerPort: 3000
+          env:
+            # Anonymous admin access for local development only, exactly as
+            # docker-compose.yml already configured it -- not a production
+            # posture, restated here since it's easy to lose sight of that
+            # once it's buried in a Deployment env list instead of sitting
+            # next to a comment in a compose file.
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: Admin
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: "true"
+          volumeMounts:
+            - name: datasource
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+      volumes:
+        - name: datasource
+          configMap:
+            name: ledgerline-grafana-datasource
+        - name: dashboard-provider
+          configMap:
+            name: ledgerline-grafana-dashboard-provider
+        - name: dashboards
+          configMap:
+            name: ledgerline-grafana-dashboards

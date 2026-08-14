@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ledgerline-app-config
+  namespace: ledgerline
+data:
+  # In-cluster Service DNS names, replacing docker-compose's localhost
+  # defaults -- see application.properties for the property names these
+  # map to via Spring's standard relaxed env-var binding.
+  SPRING_DATASOURCE_URL: "jdbc:postgresql://ledgerline-postgres:5432/ledgerline"
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: "ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:9092"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ledgerline-app-secret
+  namespace: ledgerline
+type: Opaque
+stringData:
+  SPRING_DATASOURCE_USERNAME: ledgerline
+  SPRING_DATASOURCE_PASSWORD: ledgerline

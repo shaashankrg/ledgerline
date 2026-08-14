@@ -1,0 +1,37 @@
+# Runs Flyway once, then exits. This is what makes the 3-simultaneous-
+# replica migration race structurally impossible rather than merely locked
+# against -- see docs/day7-8-migration-race.md for the full reasoning. In
+# raw manifests (Day 7), this Job must be applied and completed by hand
+# before the processor Deployment; the Helm chart (Day 8) automates that
+# ordering via a pre-install/pre-upgrade hook.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ledgerline-migrate
+  namespace: ledgerline
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h ledgerline-postgres -U ledgerline -d ledgerline; do
+                echo "waiting for postgres..."
+                sleep 3
+              done
+      containers:
+        - name: migrate
+          image: ledgerline:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--spring.profiles.active=migrate"]
+          envFrom:
+            - configMapRef:
+                name: ledgerline-app-config
+            - secretRef:
+                name: ledgerline-app-secret

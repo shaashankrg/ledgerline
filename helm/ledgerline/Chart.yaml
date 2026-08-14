@@ -1,0 +1,12 @@
+apiVersion: v2
+name: ledgerline
+description: >
+  Ledgerline: a payment ledger + reconciliation engine, deployed as processor
+  replicas, a reconciliation CronJob, a generator Job, and their Postgres/
+  Kafka/Prometheus/Grafana dependencies. Built for Day 9's chaos test
+  (kubectl delete pod against a live processor, under real load, proving the
+  ledger survives) -- everything in this chart exists in service of getting
+  to that point cleanly from a single `helm install`.
+type: application
+version: 0.1.0
+appVersion: "0.0.1-SNAPSHOT"

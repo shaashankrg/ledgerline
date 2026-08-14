@@ -1,0 +1,33 @@
+Ledgerline is installed.
+
+Migrations ran once, via a dedicated pre-install hook Job
+({{ .Release.Name }}-migrate), before any processor replica was created --
+see templates/jobs/migrate-job.yaml for why this makes the 3-simultaneous-
+replica migration race structurally impossible rather than merely locked
+against by Flyway's own advisory lock.
+
+Check the pipeline:
+  kubectl get pods -n {{ .Release.Namespace }}
+  kubectl logs -n {{ .Release.Namespace }} -l app={{ .Release.Name }}-processor
+
+Check readiness (should show assignedPartitionCount > 0 on every replica
+once the consumer group has settled):
+  kubectl exec -n {{ .Release.Namespace }} \
+    $(kubectl get pod -n {{ .Release.Namespace }} -l app={{ .Release.Name }}-processor -o jsonpath='{.items[0].metadata.name}') \
+    -- wget -qO- http://localhost:8080/actuator/health/readiness
+
+Grafana (dashboard "Ledgerline" is provisioned automatically, no manual
+import): http://localhost:3000
+  (kind maps this via extraPortMappings in k8s/kind-config.yaml -- adjust if
+  running against a different cluster)
+
+Prometheus: http://localhost:9090
+
+Reconciliation runs on the schedule set in values.yaml (recon.schedule,
+currently "{{ .Values.recon.schedule }}"). To trigger one immediately:
+  kubectl create job -n {{ .Release.Namespace }} --from=cronjob/{{ .Release.Name }}-recon manual-recon-run
+
+To generate more traffic (the generator Job that ran at install time already
+published {{ .Values.generator.transactionCount }} transactions at seed
+{{ .Values.generator.seed }}):
+  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set generator.seed=<new-seed>

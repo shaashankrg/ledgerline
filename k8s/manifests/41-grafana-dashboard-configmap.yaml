@@ -1,0 +1,133 @@
+apiVersion: v1
+data:
+  ledgerline.json: |
+    {
+      "id": null,
+      "uid": "ledgerline-core",
+      "title": "Ledgerline",
+      "tags": ["ledgerline"],
+      "timezone": "browser",
+      "editable": true,
+      "refresh": "10s",
+      "time": { "from": "now-15m", "to": "now" },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Ledger invariant delta",
+          "description": "Sum of every ledger_entries row. Zero means every transaction still balances; any other value means an unbalanced write reached the table -- the single correctness instrument on this dashboard, everything else here is a performance one.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "targets": [
+            {
+              "expr": "ledger_invariant_delta_minor",
+              "legendFormat": "delta",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "currencyUSD",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 0.0001 },
+                  { "color": "red", "value": -0.0001 }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 2,
+          "title": "Unbalanced accounts",
+          "description": "Count of distinct accounts implicated by a currently-unbalanced transaction. Per-account, not global -- catches offsetting errors across two accounts that sum to zero and would otherwise hide from the delta panel alone.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "targets": [
+            {
+              "expr": "ledger_unbalanced_accounts",
+              "legendFormat": "unbalanced accounts",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 1 }
+                ]
+              }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 3,
+          "title": "Consumer lag by partition",
+          "description": "kafka_consumer_fetch_manager_records_lag, per partition of the transactions topic -- how far the consumer group is behind the log head.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "targets": [
+            {
+              "expr": "kafka_consumer_fetch_manager_records_lag{topic=\"transactions\"}",
+              "legendFormat": "partition {{partition}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 4,
+          "title": "Reconciliation exceptions by type",
+          "description": "recon_exceptions_total{type}, rate over the last 5 minutes.",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "targets": [
+            {
+              "expr": "rate(recon_exceptions_total[5m])",
+              "legendFormat": "{{type}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0
+            },
+            "overrides": []
+          }
+        }
+      ],
+      "templating": {
+        "list": [
+          {
+            "name": "DS_PROMETHEUS",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": { "text": "Prometheus", "value": "Prometheus" }
+          }
+        ]
+      },
+      "schemaVersion": 39,
+      "version": 1
+    }
+kind: ConfigMap
+metadata:
+  name: ledgerline-grafana-dashboards
+  namespace: ledgerline

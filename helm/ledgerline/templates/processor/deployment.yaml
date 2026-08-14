@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-app-config
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+data:
+  SPRING_DATASOURCE_URL: "jdbc:postgresql://{{ include "ledgerline.postgresHost" . | trimSuffix "\n" }}:5432/ledgerline"
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: "{{ include "ledgerline.kafkaBootstrap" . | trimSuffix "\n" }}"
+  LEDGERLINE_CONSUMER_CONCURRENCY: "{{ .Values.processor.consumer.concurrency }}"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Release.Name }}-app-secret
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  SPRING_DATASOURCE_USERNAME: ledgerline
+  SPRING_DATASOURCE_PASSWORD: ledgerline
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-processor
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: {{ .Release.Name }}-processor
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-processor
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.processor.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-processor
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-processor
+    spec:
+      containers:
+        - name: processor
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: {{ .Release.Name }}-app-config
+            - secretRef:
+                name: {{ .Release.Name }}-app-secret
+          env:
+            # Never runs migrations itself -- see templates/jobs/migrate-job.yaml
+            # for the full reasoning on why this has to be false here.
+            - name: SPRING_FLYWAY_ENABLED
+              value: "false"
+          resources:
+            {{- toYaml .Values.processor.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 3

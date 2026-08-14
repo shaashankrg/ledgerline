@@ -1,0 +1,22 @@
+# kind cluster for local development and Day 9's chaos test (`kubectl delete
+# pod` against a live, real-if-small cluster). One control-plane node is
+# sufficient -- this project has no need to test control-plane HA, only
+# whether the ledger survives a killed processor pod.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ledgerline
+nodes:
+  - role: control-plane
+    # Exposes the in-cluster NodePort services on the host, so Prometheus/
+    # Grafana/the app remain reachable at localhost the same way they were
+    # under docker-compose, without a separate port-forward per service.
+    extraPortMappings:
+      - containerPort: 30080  # ledgerline processor (actuator/health)
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 30090  # prometheus
+        hostPort: 9090
+        protocol: TCP
+      - containerPort: 30030  # grafana
+        hostPort: 3000
+        protocol: TCP

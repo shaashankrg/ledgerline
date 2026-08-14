@@ -1,0 +1,43 @@
+{{- if .Values.generator.enabled }}
+# Runs to completion, doesn't need to be a long-lived service -- see
+# com.ledgerline.cli.GenerateCommand, the entrypoint this Job runs.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-generator
+  labels:
+    {{- include "ledgerline.labels" . | nindent 4 }}
+  annotations:
+    # post-install/post-upgrade: the generator publishes real traffic, which
+    # only makes sense once the processor Deployment (a normal resource,
+    # applied after every pre-install hook completes) actually exists to
+    # consume it -- running this any earlier would just pile messages onto
+    # a topic nothing is reading yet.
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: generator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--spring.profiles.active=generate"
+            - "--seed={{ .Values.generator.seed }}"
+            - "--count={{ .Values.generator.transactionCount }}"
+            - "--rate={{ .Values.generator.ratePerSecond }}"
+            - "--fault.duplicatePublish={{ .Values.generator.faultRates.duplicatePublish }}"
+            - "--fault.outOfOrder={{ .Values.generator.faultRates.outOfOrder }}"
+            - "--fault.orphanCapture={{ .Values.generator.faultRates.orphanCapture }}"
+            - "--fault.amountDrift={{ .Values.generator.faultRates.amountDrift }}"
+            - "--fault.missingSettlement={{ .Values.generator.faultRates.missingSettlement }}"
+          envFrom:
+            - configMapRef:
+                name: {{ .Release.Name }}-app-config
+            - secretRef:
+                name: {{ .Release.Name }}-app-secret
+{{- end }}

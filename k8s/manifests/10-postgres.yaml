@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ledgerline-postgres
+  namespace: ledgerline
+type: Opaque
+stringData:
+  POSTGRES_DB: ledgerline
+  POSTGRES_USER: ledgerline
+  POSTGRES_PASSWORD: ledgerline
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerline-postgres
+  namespace: ledgerline
+spec:
+  # headless: a StatefulSet's own DNS identity comes from this, and nothing
+  # here needs a single stable virtual IP (there is exactly one pod).
+  clusterIP: None
+  selector:
+    app: ledgerline-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ledgerline-postgres
+  namespace: ledgerline
+spec:
+  serviceName: ledgerline-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ledgerline-postgres
+  template:
+    metadata:
+      labels:
+        app: ledgerline-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: ledgerline-postgres
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+              # Postgres refuses to initialize directly on a volume mount's
+              # root when the mount itself carries a lost+found directory
+              # (common on ext4-backed PVCs) -- a subdirectory sidesteps
+              # that entirely rather than depending on the volume's
+              # filesystem happening not to have one.
+              subPath: pgdata
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ledgerline", "-d", "ledgerline"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ledgerline", "-d", "ledgerline"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

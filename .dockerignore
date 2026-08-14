@@ -1,0 +1,13 @@
+target/
+.git/
+.vscode/
+.idea/
+.mvn/wrapper/maven-wrapper.jar
+*.iml
+boot.log
+boot.err
+k8s/
+helm/
+observability/
+docs/
+CODEBASE_GUIDE.md
