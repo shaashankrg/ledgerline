@@ -21,6 +21,7 @@ import com.ledgerline.ledger.LedgerWriter;
 import com.ledgerline.ledger.ParkedEventRepository;
 import com.ledgerline.ledger.ParkedEventRepository.ParkedEvent;
 import com.ledgerline.ledger.TransactionStateRepository;
+import com.ledgerline.metrics.LedgerlineMetrics;
 
 /**
  * Applies a lifecycle event to a transaction. The only writer to the ledger.
@@ -51,15 +52,18 @@ public class TransactionEventService {
     private final TransactionStateRepository states;
     private final LedgerWriter ledgerWriter;
     private final ParkedEventRepository parkedEvents;
+    private final LedgerlineMetrics metrics;
 
     TransactionEventService(EventValidator validator,
             TransactionStateRepository states,
             LedgerWriter ledgerWriter,
-            ParkedEventRepository parkedEvents) {
+            ParkedEventRepository parkedEvents,
+            LedgerlineMetrics metrics) {
         this.validator = validator;
         this.states = states;
         this.ledgerWriter = ledgerWriter;
         this.parkedEvents = parkedEvents;
+        this.metrics = metrics;
     }
 
     /**
@@ -120,7 +124,14 @@ public class TransactionEventService {
             // redelivery, in which case the state is already correct and there
             // is nothing to do, or the key was reused for a different payload,
             // which is an error.
+            //
+            // requireMatchingPayload throws on a genuine mismatch (counted at
+            // its own throw site, LedgerWriter.requireMatchingPayload) rather
+            // than returning here -- reaching this line means the payload
+            // matched, so this is the harmless-redelivery counter, not the
+            // mismatch one.
             ledgerWriter.requireMatchingPayload(event.eventId(), payloadHash);
+            metrics.idempotentDuplicateRejected();
             return new EventResult(currentStateOf(event), true);
         }
 
@@ -145,6 +156,7 @@ public class TransactionEventService {
         }
 
         writeEntries(event, claimedRowId.get());
+        metrics.paymentProcessed(event.type().name());
 
         // An authorize is what parked events were waiting for. Draining here,
         // inside the same transaction, means the drain commits or rolls back
@@ -176,11 +188,13 @@ public class TransactionEventService {
 
         if (!early) {
             // Has a history this event contradicts. Permanent.
+            metrics.stateTransitionRejected(current.name(), event.type().name());
             throw new IllegalTransitionException(current, event.type());
         }
 
         ledgerWriter.releaseClaim(event.eventId());
         parkedEvents.park(event);
+        metrics.parkedEvent("early");
 
         if (transactionIsNew) {
             // This event created the state row and is not going to use it.
@@ -230,6 +244,7 @@ public class TransactionEventService {
                             "still not applicable when drained");
                 } else {
                     parkedEvents.markApplied(parked.parkedId());
+                    metrics.parkedEventDrained();
                 }
             } catch (IllegalTransitionException e) {
                 // Still illegal even now. Not retried again: see above.

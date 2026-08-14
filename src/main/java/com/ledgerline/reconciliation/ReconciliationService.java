@@ -17,6 +17,7 @@ import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.ledgerline.metrics.LedgerlineMetrics;
 import com.ledgerline.reconciliation.CapturedLedgerView.CapturedPayment;
 
 /**
@@ -83,14 +84,17 @@ public class ReconciliationService {
     private final NamedParameterJdbcTemplate jdbc;
     private final CapturedLedgerView capturedLedgerView;
     private final PaymentStateView paymentStateView;
+    private final LedgerlineMetrics metrics;
 
     ReconciliationService(
             @ReconRoleDataSource NamedParameterJdbcTemplate jdbc,
             CapturedLedgerView capturedLedgerView,
-            PaymentStateView paymentStateView) {
+            PaymentStateView paymentStateView,
+            LedgerlineMetrics metrics) {
         this.jdbc = jdbc;
         this.capturedLedgerView = capturedLedgerView;
         this.paymentStateView = paymentStateView;
+        this.metrics = metrics;
     }
 
     /**
@@ -428,6 +432,7 @@ public class ReconciliationService {
             String externalTxnId, List<Integer> lineNumbers,
             Long settlementAmountMinor, Long ledgerAmountMinor, Long deltaMinor, String paymentState) {
 
+        metrics.reconException(type.name());
         jdbc.update(
                 "INSERT INTO recon_exceptions "
                         + "(recon_run_id, subject_key, type, external_txn_id, settlement_line_numbers, "

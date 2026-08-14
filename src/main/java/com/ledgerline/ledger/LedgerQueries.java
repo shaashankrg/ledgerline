@@ -30,6 +30,65 @@ public class LedgerQueries {
         this.jdbc = jdbc;
     }
 
+    /**
+     * The system-wide invariant delta: the sum of every entry ever written.
+     *
+     * Zero exactly when every transaction's entries balance -- each balanced
+     * pair sums to zero by construction (EntryGroup will not let an unbalanced
+     * one be built), so the only way this can be nonzero is a write that
+     * bypassed that guarantee, such as a single-sided row inserted directly
+     * via SQL. COALESCE keeps an empty table at zero rather than null.
+     *
+     * "Minor" in the gauge name this backs ({@code ledger_invariant_delta_minor})
+     * refers to the finest unit the ledger itself tracks -- {@code
+     * ledger_entries.amount} is {@code NUMERIC(19,4)}, i.e. already at its own
+     * smallest denomination -- not a conversion to cents. Unlike the
+     * reconciliation module's {@code gross_amount_minor} columns, there is no
+     * x100 step here: rescaling would either lose the 4th decimal place ledger
+     * writes actually use, or invent a unit this table does not have.
+     */
+    public BigDecimal invariantDeltaMinor() {
+        return jdbc.queryForObject(
+                "SELECT COALESCE(SUM(amount), 0) FROM ledger_entries",
+                new MapSqlParameterSource(), BigDecimal.class);
+    }
+
+    /**
+     * Every account implicated by a currently-unbalanced transaction, with
+     * that account's net contribution to the imbalance.
+     *
+     * The global delta above can only say "something is wrong somewhere" --
+     * two offsetting errors in different accounts sum to zero and vanish from
+     * it entirely, the same blind spot that has bitten this project at the
+     * application layer more than once. This is the per-item check: it names
+     * which transaction is unbalanced and which account holds the orphaned
+     * entry, not just that the total moved.
+     */
+    public List<UnbalancedAccount> unbalancedAccounts() {
+        return jdbc.query(
+                """
+                SELECT e.account_id AS account_id,
+                       e.transaction_id AS transaction_id,
+                       SUM(e.amount) AS net_amount
+                FROM ledger_entries e
+                WHERE e.transaction_id IN (
+                    SELECT transaction_id FROM ledger_entries
+                    GROUP BY transaction_id HAVING SUM(amount) <> 0
+                )
+                GROUP BY e.account_id, e.transaction_id
+                ORDER BY e.transaction_id, e.account_id
+                """,
+                new MapSqlParameterSource(),
+                (rs, rowNum) -> new UnbalancedAccount(
+                        rs.getLong("account_id"),
+                        rs.getLong("transaction_id"),
+                        rs.getBigDecimal("net_amount")));
+    }
+
+    /** An account's contribution to one unbalanced transaction. */
+    public record UnbalancedAccount(long accountId, long transactionId, BigDecimal netAmount) {
+    }
+
     /** An account's currency, or empty when no such account exists. */
     public Optional<String> findAccountCurrency(long accountId) {
         try {

@@ -1,0 +1,16 @@
+global:
+  # Below this, Prometheus's own scrape interval would be finer than the
+  # invariant gauges' own recompute cadence (ledgerline.metrics.invariant-check-interval,
+  # 15s by default) -- scraping faster than the value changes would just
+  # re-read the same cached number. Matched to that, not chosen independently.
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: ledgerline
+    metrics_path: /actuator/prometheus
+    static_configs:
+      # host.docker.internal: the app runs on the host during development
+      # (make demo / mvn spring-boot:run), not as a compose service -- see the
+      # Makefile. If the app is ever containerized, this becomes a service
+      # name instead.
+      - targets: ["host.docker.internal:8080"]

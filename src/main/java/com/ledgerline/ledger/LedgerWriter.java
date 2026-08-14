@@ -13,6 +13,7 @@ import org.springframework.transaction.annotation.Transactional;
 import com.ledgerline.domain.EntryGroup;
 import com.ledgerline.domain.IdempotencyKeyReuseException;
 import com.ledgerline.domain.LedgerEntry;
+import com.ledgerline.metrics.LedgerlineMetrics;
 
 /**
  * Minimal write path for balanced transactions.
@@ -25,9 +26,11 @@ import com.ledgerline.domain.LedgerEntry;
 public class LedgerWriter {
 
     private final NamedParameterJdbcTemplate jdbc;
+    private final LedgerlineMetrics metrics;
 
-    LedgerWriter(NamedParameterJdbcTemplate jdbc) {
+    LedgerWriter(NamedParameterJdbcTemplate jdbc, LedgerlineMetrics metrics) {
         this.jdbc = jdbc;
+        this.metrics = metrics;
     }
 
     /**
@@ -156,6 +159,7 @@ public class LedgerWriter {
         // A row written without a hash cannot be shown to match, and treating
         // an absent hash as a match would let any payload replay it.
         if (storedHash == null || !storedHash.trim().equals(payloadHash)) {
+            metrics.payloadHashMismatch();
             throw new IdempotencyKeyReuseException(eventId);
         }
     }

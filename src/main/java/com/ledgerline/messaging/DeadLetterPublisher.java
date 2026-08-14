@@ -9,6 +9,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
+import com.ledgerline.metrics.LedgerlineMetrics;
+
 /**
  * Publishes messages that can never be processed to the dead letter topic.
  *
@@ -31,9 +33,11 @@ class DeadLetterPublisher {
     private static final Logger log = LoggerFactory.getLogger(DeadLetterPublisher.class);
 
     private final KafkaTemplate<String, String> deadLetterKafkaTemplate;
+    private final LedgerlineMetrics metrics;
 
-    DeadLetterPublisher(KafkaTemplate<String, String> deadLetterKafkaTemplate) {
+    DeadLetterPublisher(KafkaTemplate<String, String> deadLetterKafkaTemplate, LedgerlineMetrics metrics) {
         this.deadLetterKafkaTemplate = deadLetterKafkaTemplate;
+        this.metrics = metrics;
     }
 
     /**
@@ -49,8 +53,9 @@ class DeadLetterPublisher {
         ProducerRecord<String, String> record = new ProducerRecord<>(DLT_TOPIC, key, payload);
 
         String reason = failure.getMessage() == null ? failure.toString() : failure.getMessage();
+        String exceptionClass = causeClassOf(failure);
         record.headers().add(REASON_HEADER, reason.getBytes(StandardCharsets.UTF_8));
-        record.headers().add(EXCEPTION_HEADER, causeClassOf(failure).getBytes(StandardCharsets.UTF_8));
+        record.headers().add(EXCEPTION_HEADER, exceptionClass.getBytes(StandardCharsets.UTF_8));
         record.headers().add(ORIGINAL_TOPIC_HEADER, topic.getBytes(StandardCharsets.UTF_8));
         record.headers().add(ORIGINAL_PARTITION_HEADER,
                 String.valueOf(partition).getBytes(StandardCharsets.UTF_8));
@@ -60,6 +65,11 @@ class DeadLetterPublisher {
             deadLetterKafkaTemplate.send(record).get(30, TimeUnit.SECONDS);
             log.warn("Sent message to {} from {}-{} offset {}: {}",
                     DLT_TOPIC, topic, partition, offset, reason);
+            // Simple class name, not the fully-qualified one: bounded and
+            // readable on a dashboard, and still one label value per
+            // exception type -- never per-message, which is what the
+            // cardinality rule forbids.
+            metrics.dlqMessage(simpleNameOf(exceptionClass));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("interrupted while publishing to " + DLT_TOPIC, e);
@@ -72,5 +82,10 @@ class DeadLetterPublisher {
     private static String causeClassOf(Throwable failure) {
         Throwable cause = failure.getCause() == null ? failure : failure.getCause();
         return cause.getClass().getName();
+    }
+
+    private static String simpleNameOf(String fullyQualifiedClassName) {
+        int lastDot = fullyQualifiedClassName.lastIndexOf('.');
+        return lastDot < 0 ? fullyQualifiedClassName : fullyQualifiedClassName.substring(lastDot + 1);
     }
 }

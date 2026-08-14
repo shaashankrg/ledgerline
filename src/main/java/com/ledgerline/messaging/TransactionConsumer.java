@@ -1,8 +1,12 @@
 package com.ledgerline.messaging;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.header.Header;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -12,6 +16,7 @@ import org.springframework.stereotype.Component;
 import com.ledgerline.domain.IllegalTransitionException;
 import com.ledgerline.domain.TransactionEvent;
 import com.ledgerline.domain.TransferException;
+import com.ledgerline.metrics.LedgerlineMetrics;
 import com.ledgerline.transfer.TransactionEventService;
 import com.ledgerline.transfer.TransactionEventService.EventResult;
 
@@ -69,13 +74,16 @@ class TransactionConsumer {
     private final TransactionMessageParser parser;
     private final TransactionEventService eventService;
     private final DeadLetterPublisher deadLetterPublisher;
+    private final LedgerlineMetrics metrics;
 
     TransactionConsumer(TransactionMessageParser parser,
             TransactionEventService eventService,
-            DeadLetterPublisher deadLetterPublisher) {
+            DeadLetterPublisher deadLetterPublisher,
+            LedgerlineMetrics metrics) {
         this.parser = parser;
         this.eventService = eventService;
         this.deadLetterPublisher = deadLetterPublisher;
+        this.metrics = metrics;
     }
 
     @KafkaListener(
@@ -90,6 +98,7 @@ class TransactionConsumer {
         try {
             List<TransactionEvent> events = parser.parse(record.value());
             EventResult result = eventService.applyAll(events);
+            recordEndToEndLatency(record);
             logOutcome(record, result);
         } catch (PermanentMessageException | TransferException | IllegalTransitionException e) {
             deadLetter(record, e);
@@ -121,5 +130,36 @@ class TransactionConsumer {
     private void deadLetter(ConsumerRecord<String, String> record, RuntimeException failure) {
         deadLetterPublisher.publish(
                 record.key(), record.value(), record.topic(), record.partition(), record.offset(), failure);
+    }
+
+    /**
+     * Measures publish-to-commit latency using the header {@link
+     * TransactionProducer} stamped at send time.
+     *
+     * Read here rather than in the parser: {@code applyAll} returning
+     * successfully is the actual "committed" instant this timer measures --
+     * reading the header before that call would measure "received", which
+     * every consumer already gets for free from Kafka's own consumer lag
+     * metric, and would not be this project's own claim.
+     *
+     * Missing or unparseable header is tolerated silently: it means the
+     * message did not come from {@link TransactionProducer} (e.g. it was
+     * published by a test harness or an external producer), which is not an
+     * error condition for this listener, just something outside what this
+     * timer can measure.
+     */
+    private void recordEndToEndLatency(ConsumerRecord<String, String> record) {
+        Header header = record.headers().lastHeader(TransactionProducer.PRODUCED_AT_HEADER);
+        if (header == null) {
+            return;
+        }
+        try {
+            long producedAtEpochMillis = Long.parseLong(new String(header.value(), StandardCharsets.UTF_8));
+            Duration latency = Duration.between(Instant.ofEpochMilli(producedAtEpochMillis), Instant.now());
+            metrics.recordEndToEndLatency(latency);
+        } catch (NumberFormatException e) {
+            log.debug("Unparseable {} header at offset {}, skipping latency measurement",
+                    TransactionProducer.PRODUCED_AT_HEADER, record.offset());
+        }
     }
 }

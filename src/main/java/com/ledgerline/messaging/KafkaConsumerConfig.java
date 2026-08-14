@@ -11,9 +11,12 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.core.MicrometerConsumerListener;
 import org.springframework.kafka.listener.ContainerProperties.AckMode;
 import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.util.backoff.FixedBackOff;
+
+import io.micrometer.core.instrument.MeterRegistry;
 
 /**
  * Consumer wiring for the {@code transactions} topic.
@@ -31,7 +34,8 @@ class KafkaConsumerConfig {
 
     @Bean
     ConsumerFactory<String, String> transactionConsumerFactory(
-            @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers) {
+            @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
+            MeterRegistry meterRegistry) {
 
         Map<String, Object> config = new HashMap<>();
         config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
@@ -72,7 +76,17 @@ class KafkaConsumerConfig {
         config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
         config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
 
-        return new DefaultKafkaConsumerFactory<>(config);
+        DefaultKafkaConsumerFactory<String, String> factory = new DefaultKafkaConsumerFactory<>(config);
+
+        // Registers each underlying Kafka client's own JMX-sourced metrics
+        // (including the per-partition records-lag gauge the consumer-lag
+        // dashboard panel reads) into the app's MeterRegistry -- this
+        // consumer's factory is hand-built rather than Spring Boot's
+        // autoconfigured one, so the usual auto-binding does not happen
+        // without wiring the listener explicitly.
+        factory.addListener(new MicrometerConsumerListener<>(meterRegistry));
+
+        return factory;
     }
 
     @Bean

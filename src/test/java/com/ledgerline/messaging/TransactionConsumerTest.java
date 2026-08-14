@@ -103,6 +103,9 @@ class TransactionConsumerTest {
     @SuppressWarnings("unused") // asserts the consumer did not take over its job
     private TransactionEventService eventService;
 
+    @Autowired
+    private io.micrometer.core.instrument.MeterRegistry meterRegistry;
+
     private long alice;
     private long bob;
 
@@ -246,6 +249,14 @@ class TransactionConsumerTest {
         assertThat(deadLettered.get(0).key()).isEqualTo(poisonId);
         assertThat(headerOf(deadLettered.get(0), DeadLetterPublisher.EXCEPTION_HEADER))
                 .contains("AmountScaleException");
+
+        // Day 5's dlq_messages_total{reason} wiring test: this is the real
+        // production call site (DeadLetterPublisher.publish, over a real
+        // broker), not a mock standing in for it.
+        io.micrometer.core.instrument.Counter counter = meterRegistry
+                .find("dlq_messages_total").tag("reason", "AmountScaleException").counter();
+        assertThat(counter).as("dlq_messages_total{reason=AmountScaleException} must be registered").isNotNull();
+        assertThat(counter.count()).isGreaterThanOrEqualTo(1.0);
     }
 
     @Test
