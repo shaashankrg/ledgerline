@@ -101,3 +101,33 @@ is a separate piece of work, not needed for anything Day 1 tests or measures.
 has to become an independently varying claim -- not a fixed rate, and not
 recomputed identically from gross on both the honest and faulted paths --
 before a `FEE_MISMATCH` fault type or detector could mean anything.
+
+---
+
+## The invariant-gauge detection-latency number is measured at a shortened interval, not the production one
+
+`RogueLedgerEntrySabotageTest` (Day 5) prints and asserts a real,
+wall-clock-measured detection latency for `ledger_invariant_delta_minor` --
+e.g. "corruption visible within ~1.5-2s." That number is measured with
+`ledgerline.metrics.invariant-check-interval` overridden to 2s via
+`@SpringBootTest(properties=...)`, not the 15s production default
+(`application.properties`).
+
+**Why the override exists:** so the test measures a real number quickly
+rather than waiting out a full 15s recompute cycle on every run. The
+mechanism this proves -- the gauge reliably moves within one scheduled
+recompute of corruption landing, with nothing computed synchronously on the
+scrape path to widen that further -- is unaffected by which interval is
+configured; the specific millisecond figure is not.
+
+**What this means for anyone quoting the number:** under the actual 15s
+production default, the honest worst-case detection bound is close to 15s
+(time until the next `@Scheduled` firing), not the 2s the test measures
+under. The test's own printed output and class Javadoc both state this
+explicitly now, specifically so the number isn't lifted into a README or
+said aloud without its configuration attached.
+
+**Closing mechanism, if ever prioritized:** a second assertion in the same
+test class, run under the real 15s default (accepting the slower test), to
+have a directly-measured production-interval number on record rather than
+one derived by inference from "the interval is the bound."

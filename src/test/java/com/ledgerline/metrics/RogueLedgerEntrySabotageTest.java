@@ -40,6 +40,17 @@ import com.ledgerline.transfer.TransactionEventService;
  * wall-clock number rather than waiting out the production interval on every
  * run -- the interval itself is still the thing being proven reactive
  * within, not something this test weakens the production default to satisfy.
+ *
+ * <b>The specific millisecond figure this test prints and asserts against
+ * describes detection latency under a 2s recompute interval, not under the
+ * 15s production default.</b> What the test actually proves is the
+ * mechanism -- the gauge reliably moves within one scheduled recompute of
+ * corruption landing, with no synchronous work on the scrape path to widen
+ * that further -- not a specific number safe to quote as "production
+ * detection latency" on its own. Under the real 15s default, the honest
+ * worst-case bound is close to 15s (time until the next {@code @Scheduled}
+ * firing), not the 2s this test is configured with. Anywhere this number
+ * gets cited outside this file, state which interval it was measured under.
  */
 @SpringBootTest(properties = "ledgerline.metrics.invariant-check-interval=2s")
 class RogueLedgerEntrySabotageTest extends AbstractPostgresTest {
@@ -112,9 +123,18 @@ class RogueLedgerEntrySabotageTest extends AbstractPostgresTest {
                 .until(() -> gauges.currentDeltaMinor().compareTo(BigDecimal.ZERO) != 0);
         Duration detectionLatency = Duration.between(corruptedAt, Instant.now());
 
+        // Labelled explicitly with the interval this run used, precisely so
+        // this number is never quoted standalone as "the" detection latency.
+        // No Prometheus scrape is involved in this test at all -- what's
+        // configured here is LedgerInvariantGauges' own @Scheduled recompute
+        // interval (ledgerline.metrics.invariant-check-interval), overridden
+        // to 2s for this test versus the 15s production default (see class
+        // Javadoc). Under the 15s default the honest bound is close to 15s,
+        // not this number.
         System.out.println("[RogueLedgerEntrySabotageTest] corruption visible in "
-                + "ledger_invariant_delta_minor within " + detectionLatency.toMillis() + "ms "
-                + "(scrape interval under test: 2000ms)");
+                + "ledger_invariant_delta_minor within " + detectionLatency.toMillis() + "ms, "
+                + "measured under a 2000ms invariant-check-interval (test override; "
+                + "production default is 15000ms and was not exercised by this test)");
 
         // The global gauge: it moved, and by exactly the rogue amount --
         // nothing else in this test wrote an unbalanced cent. No scale
