@@ -35,6 +35,7 @@ class KafkaConsumerConfig {
     @Bean
     ConsumerFactory<String, String> transactionConsumerFactory(
             @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
+            @Value("${ledgerline.consumer.auto-commit-enabled:false}") boolean autoCommitEnabled,
             MeterRegistry meterRegistry) {
 
         Map<String, Object> config = new HashMap<>();
@@ -42,7 +43,8 @@ class KafkaConsumerConfig {
         config.put(ConsumerConfig.GROUP_ID_CONFIG, GROUP_ID);
 
         /*
-         * Auto-commit is off, and that is the load-bearing setting here.
+         * Auto-commit is off by default, and that is the load-bearing setting
+         * here.
          *
          * With enable.auto.commit=true the client commits offsets on a timer,
          * independently of whether the record was actually handled. A record
@@ -56,8 +58,16 @@ class KafkaConsumerConfig {
          * which is safe because TransferService is idempotent on the
          * transaction id. At-least-once plus idempotent writes is a correct
          * ledger; at-most-once is a lost transfer.
+         *
+         * ledgerline.consumer.auto-commit-enabled exists for exactly one
+         * purpose: Day 9's deferred-gap measurement of how many payments
+         * auto-commit actually loses under a real pod kill, against the real
+         * Deployment's consumer -- not a simulated approximation. Default is
+         * false everywhere except that one temporary chaos run, which flips
+         * it via a Helm values override and reverts it immediately after
+         * recording the loss count. See docs/day9-auto-commit-loss.md.
          */
-        config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, autoCommitEnabled);
 
         // A new group reads the topic from the beginning rather than skipping
         // whatever was published before it first subscribed.
@@ -93,6 +103,7 @@ class KafkaConsumerConfig {
     ConcurrentKafkaListenerContainerFactory<String, String> transactionListenerContainerFactory(
             ConsumerFactory<String, String> transactionConsumerFactory,
             @Value("${ledgerline.consumer.concurrency:1}") int concurrency,
+            @Value("${ledgerline.consumer.auto-commit-enabled:false}") boolean autoCommitEnabled,
             KafkaConsumerGroupHealth consumerGroupHealth) {
 
         ConcurrentKafkaListenerContainerFactory<String, String> factory =
@@ -111,8 +122,18 @@ class KafkaConsumerConfig {
          * boundary would redeliver work that was already acknowledged in
          * memory -- harmless here given idempotency, but it makes the offset
          * lag the truth for longer than necessary.
+         *
+         * Spring Kafka asserts at container startup that a manual AckMode
+         * cannot be paired with a consumer that has enable.auto.commit=true
+         * (it would be ambiguous which side owns commit timing), so Day 9's
+         * auto-commit-enabled override has to flip both settings together:
+         * when the Kafka client is allowed to auto-commit on its own timer,
+         * the container must step back to AckMode.BATCH so Spring isn't
+         * also trying to drive commits and tripping that assertion. BATCH is
+         * the ordinary default for a client-auto-committing consumer; it does
+         * not itself commit anything; the client's own timer does.
          */
-        factory.getContainerProperties().setAckMode(AckMode.MANUAL_IMMEDIATE);
+        factory.getContainerProperties().setAckMode(autoCommitEnabled ? AckMode.BATCH : AckMode.MANUAL_IMMEDIATE);
 
         // The actual readiness signal (Day 8): registered as the container's
         // own rebalance callback, so KafkaConsumerGroupHealth's state flips

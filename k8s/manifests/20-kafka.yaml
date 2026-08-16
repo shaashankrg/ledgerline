@@ -5,6 +5,12 @@ metadata:
   namespace: ledgerline
 spec:
   clusterIP: None
+  # See helm/ledgerline/templates/kafka/statefulset.yaml's identical Service
+  # for why this is required with 3 brokers: without it, DNS for each
+  # broker's peers isn't published until that peer is Ready, but no broker
+  # can become Ready without first reaching its peers via this DNS to form
+  # the KRaft controller quorum -- a deadlock.
+  publishNotReadyAddresses: true
   selector:
     app: ledgerline-kafka
   ports:
@@ -18,6 +24,58 @@ spec:
       port: 29092
       targetPort: 29092
 ---
+# NodePort per broker -- see helm/ledgerline/templates/kafka/statefulset.yaml's
+# identical Services for the full reasoning (a plain port-forward doesn't
+# work for a real Kafka client's post-handshake reconnect, and with 3
+# brokers that reconnect can land on any of them).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerline-kafka-0-external
+  namespace: ledgerline
+spec:
+  selector:
+    app: ledgerline-kafka
+    statefulset.kubernetes.io/pod-name: ledgerline-kafka-0
+  ports:
+    - name: external
+      port: 9094
+      targetPort: 9094
+      nodePort: 30094
+  type: NodePort
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerline-kafka-1-external
+  namespace: ledgerline
+spec:
+  selector:
+    app: ledgerline-kafka
+    statefulset.kubernetes.io/pod-name: ledgerline-kafka-1
+  ports:
+    - name: external
+      port: 9095
+      targetPort: 9095
+      nodePort: 30095
+  type: NodePort
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerline-kafka-2-external
+  namespace: ledgerline
+spec:
+  selector:
+    app: ledgerline-kafka
+    statefulset.kubernetes.io/pod-name: ledgerline-kafka-2
+  ports:
+    - name: external
+      port: 9096
+      targetPort: 9096
+      nodePort: 30096
+  type: NodePort
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -25,10 +83,10 @@ metadata:
   namespace: ledgerline
 spec:
   serviceName: ledgerline-kafka
-  # Single-broker, deliberately -- Day 7 explicitly defers the multi-broker
-  # topology to Day 10. Fewer moving parts while the cluster plumbing itself
-  # is still being debugged; scaling this to 3 brokers is out of scope here.
-  replicas: 1
+  # Day 10: 3 brokers, KRaft mode, replication factor 3 / min.insync.replicas
+  # 2 -- see docs/day10-multi-broker.md for the full reasoning.
+  replicas: 3
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: ledgerline-kafka
@@ -44,37 +102,43 @@ spec:
             - containerPort: 9092
             - containerPort: 9093
             - containerPort: 29092
+            - containerPort: 9094
+            - containerPort: 9095
+            - containerPort: 9096
+          # KAFKA_NODE_ID and KAFKA_ADVERTISED_LISTENERS must be distinct per
+          # broker -- derived from $HOSTNAME's ordinal at container start,
+          # same as the Helm chart's version of this StatefulSet. See that
+          # file's comment for the full reasoning.
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              ordinal="${HOSTNAME##*-}"
+              external_port=$((9094 + ordinal))
+              export KAFKA_NODE_ID=$((ordinal + 1))
+              export KAFKA_LISTENERS="PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:${external_port}"
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://ledgerline-kafka-${ordinal}.ledgerline-kafka.ledgerline.svc.cluster.local:9092,INTERNAL://ledgerline-kafka-${ordinal}.ledgerline-kafka.ledgerline.svc.cluster.local:29092,EXTERNAL://localhost:${external_port}"
+              exec /etc/confluent/docker/run
           env:
-            - name: KAFKA_NODE_ID
-              value: "1"
             - name: KAFKA_PROCESS_ROLES
               value: broker,controller
-            # Pod DNS name under the headless Service, matching
-            # docker-compose's `1@kafka:9093` shape but with the in-cluster
-            # equivalent hostname.
             - name: KAFKA_CONTROLLER_QUORUM_VOTERS
-              value: "1@ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:9093"
+              value: "1@ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:9093,2@ledgerline-kafka-1.ledgerline-kafka.ledgerline.svc.cluster.local:9093,3@ledgerline-kafka-2.ledgerline-kafka.ledgerline.svc.cluster.local:9093"
             - name: KAFKA_CONTROLLER_LISTENER_NAMES
               value: CONTROLLER
-            - name: KAFKA_LISTENERS
-              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:29092"
-            # Advertised listener is the in-cluster Service DNS name now,
-            # not localhost -- this is the one line that has to change from
-            # docker-compose's shape for anything inside the cluster
-            # (the processor, the generator, kafka-init) to reach the broker
-            # by name.
-            - name: KAFKA_ADVERTISED_LISTENERS
-              value: "PLAINTEXT://ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:9092,INTERNAL://ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:29092"
             - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
-              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT"
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
             - name: KAFKA_INTER_BROKER_LISTENER_NAME
               value: INTERNAL
             - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
-              value: "1"
+              value: "3"
             - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
-              value: "1"
+              value: "3"
             - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
-              value: "1"
+              value: "2"
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              value: "2"
             - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
               value: "0"
             - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
@@ -152,6 +216,8 @@ spec:
             - -c
             - |
               kafka-topics --bootstrap-server ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:29092 \
-                --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1 && \
+                --create --if-not-exists --topic transactions --partitions 3 --replication-factor 3 \
+                --config min.insync.replicas=2 && \
               kafka-topics --bootstrap-server ledgerline-kafka-0.ledgerline-kafka.ledgerline.svc.cluster.local:29092 \
-                --create --if-not-exists --topic transactions.DLT --partitions 1 --replication-factor 1
+                --create --if-not-exists --topic transactions.DLT --partitions 1 --replication-factor 3 \
+                --config min.insync.replicas=2

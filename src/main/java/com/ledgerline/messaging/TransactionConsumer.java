@@ -98,7 +98,7 @@ class TransactionConsumer {
         try {
             List<TransactionEvent> events = parser.parse(record.value());
             EventResult result = eventService.applyAll(events);
-            recordEndToEndLatency(record);
+            recordEndToEndLatency(record, events);
             logOutcome(record, result);
         } catch (PermanentMessageException | TransferException | IllegalTransitionException e) {
             deadLetter(record, e);
@@ -133,6 +133,27 @@ class TransactionConsumer {
     }
 
     /**
+     * Threshold above which a write is logged as landing during an
+     * "extended catch-up window" rather than ordinary processing.
+     *
+     * Day 11 instrumentation (see docs/known-limitations.md's 2026-08-16
+     * torn-ledger-write entry): the one confirmed data-integrity incident
+     * from Day 10 landed 173s after its run's generation began, during
+     * smooth/undisturbed consumer traffic with no gap around it -- not
+     * adjacent to a pod kill. The investigation could not pin an exact
+     * kill-to-write interval because nothing was logging publish-to-commit
+     * latency at the time a write with unusually high latency actually
+     * happened; this fixes that gap going forward. 5s is comfortably above
+     * normal end-to-end latency under load (single-digit milliseconds per
+     * the offset-application log cadence observed throughout this
+     * project's chaos runs) and comfortably below "the consumer group is
+     * still mid-rebalance" territory, so it flags a write that took an
+     * unusually long time to arrive without being noise on every ordinary
+     * message.
+     */
+    private static final Duration EXTENDED_CATCH_UP_THRESHOLD = Duration.ofSeconds(5);
+
+    /**
      * Measures publish-to-commit latency using the header {@link
      * TransactionProducer} stamped at send time.
      *
@@ -148,7 +169,7 @@ class TransactionConsumer {
      * error condition for this listener, just something outside what this
      * timer can measure.
      */
-    private void recordEndToEndLatency(ConsumerRecord<String, String> record) {
+    private void recordEndToEndLatency(ConsumerRecord<String, String> record, List<TransactionEvent> events) {
         Header header = record.headers().lastHeader(TransactionProducer.PRODUCED_AT_HEADER);
         if (header == null) {
             return;
@@ -157,6 +178,25 @@ class TransactionConsumer {
             long producedAtEpochMillis = Long.parseLong(new String(header.value(), StandardCharsets.UTF_8));
             Duration latency = Duration.between(Instant.ofEpochMilli(producedAtEpochMillis), Instant.now());
             metrics.recordEndToEndLatency(latency);
+            if (latency.compareTo(EXTENDED_CATCH_UP_THRESHOLD) > 0) {
+                // Not itself evidence of anything wrong -- most extended-
+                // catch-up writes are entirely benign, exactly like the
+                // vast majority of writes during Day 10's own catch-up
+                // tails were. The point is only that if a torn write ever
+                // recurs, whoever investigates it can grep for this line
+                // near the affected transaction's externalTxnId and
+                // immediately know it landed during exactly this kind of
+                // window, rather than reconstructing that fact after the
+                // evidence has aged out of Kubernetes' event retention (as
+                // happened investigating the Day 10 incident).
+                String externalTxnIds = events.stream()
+                        .map(TransactionEvent::externalTxnId)
+                        .distinct()
+                        .reduce((a, b) -> a + "," + b)
+                        .orElse("");
+                log.debug("Extended catch-up window write: offset={} latency={} externalTxnIds={}",
+                        record.offset(), latency, externalTxnIds);
+            }
         } catch (NumberFormatException e) {
             log.debug("Unparseable {} header at offset {}, skipping latency measurement",
                     TransactionProducer.PRODUCED_AT_HEADER, record.offset());

@@ -20,3 +20,31 @@ nodes:
       - containerPort: 30030  # grafana
         hostPort: 3000
         protocol: TCP
+      # Kafka's EXTERNAL listener (see helm/ledgerline/templates/kafka/
+      # statefulset.yaml) -- needed because a plain port-forward to Kafka
+      # does not work for a real client: after the initial connection, the
+      # Kafka protocol tells the client to reconnect using the broker's
+      # advertised address, and a cluster-internal DNS name is not
+      # resolvable from the host. This NodePort plus an EXTERNAL advertised
+      # listener of "localhost:9094" (this hostPort, not the containerPort/
+      # NodePort number) closes that gap, the same pattern already used for
+      # the processor/Prometheus/Grafana NodePorts above.
+      # Day 9's ChaosInvariantTest and Day 10's multi-broker acks
+      # comparison both depend on this.
+      #
+      # Day 10 scales Kafka to 3 brokers, and a host-side client's
+      # post-metadata reconnect can land on *any* of them, not just broker
+      # 0 -- so all 3 need their own host-mapped EXTERNAL port, not just the
+      # one this comment used to describe. Each broker's ordinal offsets
+      # both the NodePort and the advertised hostPort by 1 (30094/9094,
+      # 30095/9095, 30096/9096), computed the same way in the StatefulSet's
+      # per-pod advertised-listener wrapper script.
+      - containerPort: 30094  # kafka broker 0, EXTERNAL listener
+        hostPort: 9094
+        protocol: TCP
+      - containerPort: 30095  # kafka broker 1, EXTERNAL listener
+        hostPort: 9095
+        protocol: TCP
+      - containerPort: 30096  # kafka broker 2, EXTERNAL listener
+        hostPort: 9096
+        protocol: TCP

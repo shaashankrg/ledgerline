@@ -30,6 +30,25 @@ processor:
     # is per-pod thread count, replicaCount is pod count, and they answer
     # different scaling questions.
     concurrency: 1
+    # Always false except for one temporary Day 9 chaos run measuring how
+    # many payments auto-commit actually loses under a real pod kill --
+    # never a permanent setting. See docs/day9-auto-commit-loss.md and
+    # KafkaConsumerConfig's comment on ledgerline.consumer.auto-commit-enabled.
+    autoCommitEnabled: false
+  producer:
+    # Always "all" except for one temporary Day 10 comparison measuring
+    # produced-vs-persisted counts under a killed partition leader with
+    # acks=1 vs acks=all -- never a permanent setting. See
+    # docs/day10-multi-broker.md and KafkaProducerConfig's comment on
+    # ledgerline.producer.acks.
+    acks: all
+  logging:
+    # DEBUG during Day 11 chaos reruns so TransactionConsumer's extended-
+    # catch-up-window trace (see docs/known-limitations.md's 2026-08-16
+    # torn-write entry) is actually visible if the signature recurs.
+    # INFO elsewhere -- this is not meant to be a permanent DEBUG setting,
+    # same pattern as autoCommitEnabled/acks above.
+    transactionConsumerLevel: INFO
 
 kafka:
   partitions: 3

@@ -9,6 +9,18 @@ metadata:
     "helm.sh/hook-weight": "-2"
 spec:
   clusterIP: None
+  # Kubernetes only publishes a headless Service's DNS records for pods the
+  # Service considers Ready by default -- fine for a client-facing Service,
+  # but fatal here: with 3 brokers, each one's own readiness depends on
+  # first reaching the *other* two via this exact DNS (to form the KRaft
+  # controller quorum), so the default behavior is a deadlock -- no broker
+  # can become Ready because DNS for its peers isn't published until they
+  # are Ready either. publishNotReadyAddresses makes every pod's DNS record
+  # resolve as soon as the pod exists, which is what peer discovery for a
+  # clustered system actually needs; readiness still gates whether client
+  # traffic (the processor, generator/recon Jobs) treats a broker as usable,
+  # which is a separate concern this setting does not touch.
+  publishNotReadyAddresses: true
   selector:
     app: {{ .Release.Name }}-kafka
   ports:
@@ -22,6 +34,47 @@ spec:
       port: 29092
       targetPort: 29092
 ---
+# NodePort, not headless -- this is the Kafka listener meant to be reached
+# from outside the cluster (a host-run JUnit test, e.g. ChaosInvariantTest).
+# A plain `kubectl port-forward` does not work for a real Kafka client here:
+# after the initial connection, the protocol tells the client to reconnect
+# using the broker's *advertised* address, and this StatefulSet's other
+# listeners all advertise a cluster-internal DNS name that the host cannot
+# resolve. Each EXTERNAL listener below advertises "localhost:<its own
+# port>" -- the kind node's mapped HOST port (see k8s/kind-config.yaml:
+# containerPort 30094-30096 -> hostPort 9094-9096), not the in-cluster
+# NodePort number itself -- specifically so a host-side client's reconnect
+# actually succeeds, whichever broker it lands on.
+#
+# One Service per broker, not one Service selecting all 3 pods: a NodePort
+# Service load-balances across every pod matching its selector, but a Kafka
+# client's post-metadata reconnect needs to land on one *specific* broker
+# (the one that's actually the partition leader, or the one whose ID a test
+# wants to target), not whichever pod the Service happens to route to. Each
+# broker's own Service selects it by its StatefulSet pod name and exposes a
+# distinct NodePort, matching the 3 host-port mappings in k8s/kind-config.yaml.
+{{- range $i := until 3 }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $.Release.Name }}-kafka-{{ $i }}-external
+  labels:
+    {{- include "ledgerline.labels" $ | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "-2"
+spec:
+  selector:
+    app: {{ $.Release.Name }}-kafka
+    statefulset.kubernetes.io/pod-name: {{ $.Release.Name }}-kafka-{{ $i }}
+  ports:
+    - name: external
+      port: {{ add 9094 $i }}
+      targetPort: {{ add 9094 $i }}
+      nodePort: {{ add 30094 $i }}
+  type: NodePort
+---
+{{- end }}
 # pre-install only -- same reasoning as the Postgres StatefulSet in
 # templates/postgres/statefulset.yaml: this must exist before migrate/
 # kafka-init run on first install, but must not be torn down and recreated
@@ -38,9 +91,13 @@ metadata:
     "helm.sh/hook-weight": "-2"
 spec:
   serviceName: {{ .Release.Name }}-kafka
-  # Single-broker, deliberately -- see Chart.yaml. Day 10 is where this
-  # becomes a 3-broker topology; this chart does not do that work early.
-  replicas: 1
+  # Day 10: 3 brokers, KRaft mode, replication factor 3 / min.insync.replicas
+  # 2 -- see docs/day10-multi-broker.md for why (a leader can be killed and
+  # the cluster keeps accepting writes; losing a second broker on top of that
+  # correctly makes the producer fail loudly instead of accepting a write
+  # only one broker holds).
+  replicas: 3
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: {{ .Release.Name }}-kafka
@@ -56,29 +113,56 @@ spec:
             - containerPort: 9092
             - containerPort: 9093
             - containerPort: 29092
+            - containerPort: 9094
+            - containerPort: 9095
+            - containerPort: 9096
+          # KAFKA_NODE_ID and KAFKA_ADVERTISED_LISTENERS must be distinct per
+          # broker, which a StatefulSet's shared podTemplate env list cannot
+          # express directly. Kubernetes guarantees each pod's own hostname
+          # is "<statefulset-name>-<ordinal>", so this wrapper derives the
+          # ordinal from $HOSTNAME at container start, exports the per-pod
+          # values, then hands off to the image's real entrypoint
+          # (/etc/confluent/docker/run) exactly as it would have run
+          # otherwise. This is the standard way to run cp-kafka as a
+          # multi-broker StatefulSet without a dedicated Helm subchart.
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              ordinal="${HOSTNAME##*-}"
+              external_port=$((9094 + ordinal))
+              export KAFKA_NODE_ID=$((ordinal + 1))
+              export KAFKA_LISTENERS="PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:${external_port}"
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://{{ .Release.Name }}-kafka-${ordinal}.{{ .Release.Name }}-kafka.{{ .Release.Namespace }}.svc.cluster.local:9092,INTERNAL://{{ .Release.Name }}-kafka-${ordinal}.{{ .Release.Name }}-kafka.{{ .Release.Namespace }}.svc.cluster.local:29092,EXTERNAL://localhost:${external_port}"
+              exec /etc/confluent/docker/run
           env:
-            - name: KAFKA_NODE_ID
-              value: "1"
             - name: KAFKA_PROCESS_ROLES
               value: broker,controller
+            # All 3 brokers' node IDs and controller ports are known upfront
+            # from the StatefulSet's stable naming scheme (ordinals 0-2 ->
+            # node IDs 1-3), so this list does not need to be computed
+            # per-pod the way NODE_ID and ADVERTISED_LISTENERS do.
             - name: KAFKA_CONTROLLER_QUORUM_VOTERS
-              value: "1@{{ include "ledgerline.kafkaBootstrap" . | trimSuffix ":9092" | trimSuffix "\n" }}:9093"
+              value: "1@{{ .Release.Name }}-kafka-0.{{ .Release.Name }}-kafka.{{ .Release.Namespace }}.svc.cluster.local:9093,2@{{ .Release.Name }}-kafka-1.{{ .Release.Name }}-kafka.{{ .Release.Namespace }}.svc.cluster.local:9093,3@{{ .Release.Name }}-kafka-2.{{ .Release.Name }}-kafka.{{ .Release.Namespace }}.svc.cluster.local:9093"
             - name: KAFKA_CONTROLLER_LISTENER_NAMES
               value: CONTROLLER
-            - name: KAFKA_LISTENERS
-              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:29092"
-            - name: KAFKA_ADVERTISED_LISTENERS
-              value: "PLAINTEXT://{{ include "ledgerline.kafkaBootstrap" . | trimSuffix "\n" }},INTERNAL://{{ include "ledgerline.kafkaInternalBootstrap" . | trimSuffix "\n" }}"
             - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
-              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT"
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
             - name: KAFKA_INTER_BROKER_LISTENER_NAME
               value: INTERNAL
             - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
-              value: "1"
+              value: "3"
             - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
-              value: "1"
+              value: "3"
             - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
-              value: "1"
+              value: "2"
+            # The cluster-wide default for topics that don't set their own --
+            # transactions/transactions.DLT set it explicitly at creation
+            # time below (min.insync.replicas=2), but this is the floor for
+            # anything auto-created or created without an explicit override.
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              value: "2"
             - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
               value: "0"
             - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
@@ -157,6 +241,8 @@ spec:
             - -c
             - |
               kafka-topics --bootstrap-server {{ include "ledgerline.kafkaInternalBootstrap" . | trimSuffix "\n" }} \
-                --create --if-not-exists --topic transactions --partitions {{ .Values.kafka.partitions }} --replication-factor 1 && \
+                --create --if-not-exists --topic transactions --partitions {{ .Values.kafka.partitions }} --replication-factor 3 \
+                --config min.insync.replicas=2 && \
               kafka-topics --bootstrap-server {{ include "ledgerline.kafkaInternalBootstrap" . | trimSuffix "\n" }} \
-                --create --if-not-exists --topic transactions.DLT --partitions {{ .Values.kafka.dltPartitions }} --replication-factor 1
+                --create --if-not-exists --topic transactions.DLT --partitions {{ .Values.kafka.dltPartitions }} --replication-factor 3 \
+                --config min.insync.replicas=2

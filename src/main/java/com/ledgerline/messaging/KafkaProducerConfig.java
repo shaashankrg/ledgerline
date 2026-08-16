@@ -28,6 +28,7 @@ class KafkaProducerConfig {
     @Bean
     ProducerFactory<String, TransactionMessage> transactionProducerFactory(
             @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
+            @Value("${ledgerline.producer.acks:all}") String acks,
             ObjectMapper objectMapper) {
 
         Map<String, Object> config = new HashMap<>();
@@ -35,7 +36,7 @@ class KafkaProducerConfig {
         config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
 
         /*
-         * acks=all, not acks=1.
+         * acks=all, not acks=1, by default.
          *
          * acks=1 acknowledges as soon as the partition leader has written the
          * record, before any follower has copied it. If that leader fails
@@ -45,12 +46,18 @@ class KafkaProducerConfig {
          * and that no consumer will ever see.
          *
          * acks=all waits for every in-sync replica. It costs latency, and on
-         * this single-node development broker it is satisfied by the one
+         * a single-node development broker it is satisfied by the one
          * replica that exists. The setting is here so the guarantee is already
          * correct when this runs against a replicated cluster, rather than
          * being something to remember to change later.
+         *
+         * ledgerline.producer.acks exists for exactly one purpose: Day 10's
+         * measured comparison of acks=all vs acks=1 against the real 3-broker
+         * cluster, run twice with a leader killed under load, recording
+         * produced-vs-persisted counts for each. Default is "all" everywhere
+         * except that one temporary comparison. See docs/day10-multi-broker.md.
          */
-        config.put(ProducerConfig.ACKS_CONFIG, "all");
+        config.put(ProducerConfig.ACKS_CONFIG, acks);
 
         /*
          * Idempotent producer: the broker deduplicates records by producer id

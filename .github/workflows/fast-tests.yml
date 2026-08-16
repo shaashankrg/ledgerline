@@ -1,0 +1,44 @@
+name: Fast tests
+
+# Runs on every push -- the tests here are exactly the ones that do NOT
+# carry an @EnabledIfSystemProperty gate (ledgerline.chaostest /
+# ledgerline.crashtest / ledgerline.chaossmoke), which is every test class
+# except CrashRecoveryTest, ChaosInvariantTest, AutoCommitLossMeasurementTest,
+# LeaderKillDurabilityTest, MinInsyncReplicasSabotageTest, and
+# TornWriteReproductionTest -- those need either a real live kind cluster
+# (chaostest) or take too long for every-push (crashtest, ~90s). A plain
+# `mvn test` with no -D flags already skips every gated class; this
+# workflow does not need its own include/exclude list to enforce that.
+on:
+  push:
+  pull_request:
+
+jobs:
+  fast-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: maven
+
+      # The fast suite includes several Testcontainers-backed classes
+      # (AbstractPostgresTest subclasses, CrashRecoveryTest is excluded by
+      # its own gate but other Testcontainers tests are not) -- these need a
+      # real Docker daemon, which ubuntu-latest runners provide out of the
+      # box. No kind/kubectl setup here: nothing in the fast suite touches a
+      # Kubernetes cluster.
+      - name: Run fast test suite
+        run: ./mvnw -B test
+
+      - name: Upload surefire reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          retention-days: 14

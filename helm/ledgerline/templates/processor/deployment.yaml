@@ -8,6 +8,13 @@ data:
   SPRING_DATASOURCE_URL: "jdbc:postgresql://{{ include "ledgerline.postgresHost" . | trimSuffix "\n" }}:5432/ledgerline"
   SPRING_KAFKA_BOOTSTRAP_SERVERS: "{{ include "ledgerline.kafkaBootstrap" . | trimSuffix "\n" }}"
   LEDGERLINE_CONSUMER_CONCURRENCY: "{{ .Values.processor.consumer.concurrency }}"
+  LEDGERLINE_CONSUMER_AUTO_COMMIT_ENABLED: "{{ .Values.processor.consumer.autoCommitEnabled }}"
+  LEDGERLINE_PRODUCER_ACKS: "{{ .Values.processor.producer.acks }}"
+  # Day 11: surfaces TransactionConsumer's extended-catch-up-window trace
+  # (see that class's comment on EXTENDED_CATCH_UP_THRESHOLD) during chaos
+  # reruns, where it matters -- default INFO everywhere else, so this is
+  # not blanket DEBUG noise in normal operation.
+  LOGGING_LEVEL_COM_LEDGERLINE_MESSAGING_TRANSACTIONCONSUMER: "{{ .Values.processor.logging.transactionConsumerLevel }}"
 ---
 apiVersion: v1
 kind: Secret
@@ -67,16 +74,29 @@ spec:
               value: "false"
           resources:
             {{- toYaml .Values.processor.resources | nindent 12 }}
+          # startupProbe delays liveness/readiness from evaluating at all
+          # until the app has actually finished starting -- this app's own
+          # startup (Spring context init + Kafka consumer group join) has
+          # been observed taking 30-40s under real load, which is longer
+          # than livenessProbe's old initialDelaySeconds:20 gave it. Without
+          # a startupProbe, a slow-but-healthy startup gets killed by
+          # liveness before it ever gets a chance to answer, which reads as
+          # a crash loop but is actually the probe timing being too tight
+          # for how long this app legitimately takes to come up.
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 24
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: 8080
-            initialDelaySeconds: 20
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: 8080
-            initialDelaySeconds: 20
             periodSeconds: 5
             failureThreshold: 3
