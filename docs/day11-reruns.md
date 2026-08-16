@@ -1,4 +1,13 @@
-# Day 11: chaos reruns -- results, one real bug found and fixed
+# Day 11: reruns, CI automation, make targets, fresh-clone verification
+
+> **Carried-forward context, not resolved by this work**: Day 10 found one
+> real, unexplained data-integrity incident (a single torn ledger write).
+> Root cause remains unconfirmed after genuine reproduction attempts on
+> both Day 10 and Day 11 (6,000+ dedicated repro transactions, plus three
+> full chaos reruns below, zero recurrences across all of it). Full
+> writeup: `docs/known-limitations.md`'s 2026-08-16 entry. That entry is
+> the authoritative record -- this file covers Day 11's reruns, CI, and
+> tooling work, all of which found **zero recurrences** of that signature.
 
 ## Instrumentation added before reruns began
 
@@ -170,3 +179,113 @@ Per Day 11's exit criterion, this satisfies "3 consecutive clean chaos
 reruns... with no recurrence of the data-integrity signature" -- counting
 rerun 3's fixed, clean second attempt as the third clean result, with the
 first (failed) attempt documented above rather than silently discarded.
+
+## CI automation
+
+Three GitHub Actions workflows, `.github/workflows/`:
+
+- **`fast-tests.yml`** -- every push and PR. Plain `mvn test`: every test
+  class runs except the six gated behind `ledgerline.chaostest` /
+  `ledgerline.crashtest` / `ledgerline.chaossmoke` (`@EnabledIfSystemProperty`,
+  false by default), which a bare `mvn test` silently skips rather than
+  needing its own exclude list. Testcontainers-backed classes run fine on
+  a standard `ubuntu-latest` runner's Docker daemon; nothing here touches a
+  Kubernetes cluster.
+- **`nightly.yml`** -- cron `0 9 * * *` plus manual dispatch. Two jobs:
+  `crash-test` (the ~90s `CrashRecoveryTest`, Testcontainers, no cluster
+  needed) and `chaos-smoke-test` (stands up a real kind cluster via
+  `helm/kind-action`, installs the chart, runs the new 2-minute
+  `ChaosInvariantTest#chaosSmokeRunHoldsTheInvariantContinuouslyAndLosesNothing`
+  -- see below). Both dump pod state/logs on failure so a red nightly run
+  is diagnosable from the Actions log alone.
+- **`full-chaos.yml`** -- `workflow_dispatch` only, deliberately not on a
+  schedule or push (running the real 10-minute test nightly alongside the
+  smoke test would double nightly CI time for a signal the smoke test
+  already gives most of). Same cluster-standup sequence, runs the full
+  `chaosRunHoldsTheInvariantContinuouslyAndLosesNothing`.
+
+### The 2-minute chaos smoke test
+
+New: `ChaosInvariantTest.chaosSmokeRunHoldsTheInvariantContinuouslyAndLosesNothing`,
+gated behind `ledgerline.chaossmoke=true` (in addition to the existing
+`ledgerline.chaostest=true`) so it doesn't run alongside the full test by
+default. Not a separate, weaker test -- the 10-minute and 2-minute
+variants both call a shared `runChaosScenario(Duration)`, so the
+mechanism, assertions, and the three explicit result lines
+(invariant-gauge / per-payment / torn-write-signature) are identical;
+only the duration differs. Real pod kills happen in a 2-minute window too
+(kill interval is 30-60s, so 2-4 kills land), so this is a genuine,
+smaller version of the same chaos exposure, not a simulation of one.
+
+## `make` targets
+
+The Makefile was rewritten (it previously targeted the Day 1-6
+docker-compose stack, stale since the Day 7-8 migration to kind+Helm) to
+front the real, current system:
+
+- **`make demo`** -- creates the kind cluster if it doesn't exist, builds
+  and loads the processor image, `helm install`s the chart, waits for the
+  processor rollout, prints the Grafana/Prometheus/processor URLs.
+- **`make chaos`** -- the full 10-minute `ChaosInvariantTest` against
+  whatever cluster `make demo` stood up.
+- **`make recon`** -- triggers the real `ledgerline-recon` CronJob
+  immediately (`kubectl create job --from=cronjob/...`), not a separate
+  local process against port-forwarded services -- this is the actual
+  mechanism a reader would see in production.
+- **`make bench`** -- runs `LoadRampCommand` (Day 6's load ramp) against
+  the live cluster's real processor Deployment, so a Grafana dashboard
+  watched during the run shows the real system degrading, not a simulated
+  one. `RATES`/`STEP` overridable (`make bench RATES=100,200 STEP=60`).
+- **`make sabotage`** -- `MinInsyncReplicasSabotageTest` against the live
+  cluster: kills 2 of 3 Kafka brokers, asserts a real publish fails
+  loudly. Does not restore the killed brokers afterward (documented in
+  the target's own comment and the test class's Javadoc) -- `make down`
+  and `make demo` again for a clean cluster afterward.
+- **`make down`** -- tears down the kind cluster entirely.
+
+A real bug was found and fixed while verifying these:
+`$(or $(RATES),50,100,200,400,800)` in the original `bench` target was
+parsed by GNU Make as `or(RATES, "50", "100", "200", "400", "800")` --
+each comma-separated value became a *separate* argument to `$(or)`, not
+part of one default string, so the default silently truncated to just
+`50`. Caught by dry-running every target (`make -n <target>`) before
+trusting any of them, not by assumption. Fixed with plain `?=` conditional
+variable assignment (`RATES ?= 50,100,200,400,800`) instead.
+
+## Fresh-clone verification
+
+Per Day 11's explicit instruction not to approximate this: the existing
+kind cluster was torn down, the cached `ledgerline:dev` Docker image was
+removed, all of this session's work was committed locally (not pushed --
+`git clone` only copies committed history, and the point was verifying
+what's actually in this working tree, not the stale pre-Day-9 state on
+the remote), and the repo was cloned into a genuinely new directory
+(outside the working directory this session developed in).
+
+`make demo` run from that fresh clone, on a machine with zero pre-existing
+kind cluster and zero cached image, completed successfully end to end on
+the first attempt: kind cluster created, image built from scratch (~2 min,
+dominated by `mvnw dependency:go-offline`), loaded, chart installed,
+processor rollout completed, all without any manual intervention or
+retry. Verified genuinely healthy afterward (not just "the command
+exited 0"):
+
+```
+NAME                                     READY   STATUS      RESTARTS   AGE
+ledgerline-generator-nkkdv               0/1     Completed   0          76s
+ledgerline-grafana-...                   1/1     Running     0          77s
+ledgerline-kafka-0                       1/1     Running     0          3m
+ledgerline-kafka-1                       1/1     Running     0          3m
+ledgerline-kafka-2                       1/1     Running     0          3m
+ledgerline-postgres-0                    1/1     Running     0          3m
+ledgerline-processor-...  (x3)           1/1     Running     0          ~76s
+ledgerline-prometheus-...                1/1     Running     0          77s
+```
+
+-- 3-broker Kafka, 3 processor replicas, all Running with zero restarts,
+and the processor logs showing real `Applied event ... transaction now
+SETTLED` lines from the install-time generator traffic, confirmed by
+tailing them directly, not inferred from pod status alone. `make recon`
+was also verified from the same fresh clone (`kubectl get jobs` showed
+`manual-recon-run-... Complete 1/1`), and `make down` cleanly tore the
+cluster back down afterward.
