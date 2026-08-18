@@ -27,6 +27,14 @@ jobs:
           distribution: temurin
           cache: maven
 
+      # CrashRecoveryTest spawns a second, real JVM process (java -jar
+      # target/ledgerline-*.jar) to simulate a genuine consumer crash --
+      # that's the point of the test, not something to fake with an
+      # in-process thread. `mvn test` alone never builds that jar; it has
+      # to be packaged first.
+      - name: Build jar
+        run: ./mvnw -B -q package -DskipTests
+
       - name: Run crash recovery test
         run: ./mvnw -B test -Dtest=CrashRecoveryTest -Dledgerline.crashtest=true
 
